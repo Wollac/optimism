@@ -1,4 +1,4 @@
-FROM op-geth:wip-risc0
+FROM op-geth:risc0
 
 RUN apk add --no-cache jq
 
