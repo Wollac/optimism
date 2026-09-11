@@ -32,11 +32,18 @@ import (
 )
 
 var (
+	// ErrForkChoiceUpdated is returned when a forkChoiceUpdated returns an error
+	ErrForkChoiceUpdated = errors.New("forkChoiceUpdated status was not valid")
 	// ErrForkChoiceUpdatedNotValid is returned when a forkChoiceUpdated returns a status other than Valid
 	ErrForkChoiceUpdatedNotValid = errors.New("forkChoiceUpdated status was not valid")
 	// ErrNewPayloadNotValid is returned when a newPayload call returns a status other than Valid, indicating the new block is invalid
 	ErrNewPayloadNotValid = errors.New("newPayload status was not valid")
 )
+
+func opGethSystemConfig(t testing.TB, opts ...e2esys.SystemConfigOpt) e2esys.SystemConfig {
+	opts = append(opts, e2esys.WithL2ELKind(services.ELKindOpGeth))
+	return e2esys.DefaultSystemConfig(t, opts...)
+}
 
 // OpGeth is an actor that functions as a l2 op-geth node
 // It provides useful functions for advancing and querying the chain
@@ -79,6 +86,8 @@ func NewOpGeth(t testing.TB, ctx context.Context, cfg *e2esys.SystemConfig) (*Op
 	}
 
 	var node services.EthInstance
+	// Intentionally op-geth: this harness exercises op-geth-specific RPC and is
+	// not routed through the el selector. Revisit when op-geth is removed.
 	gethNode, err := geth.InitL2("l2", l2Genesis, cfg.JWTFilePath)
 	require.NoError(t, err)
 	require.NoError(t, gethNode.Node.Start())
@@ -188,7 +197,7 @@ func (d *OpGeth) StartBlockBuilding(ctx context.Context, attrs *eth.PayloadAttri
 	}
 	res, err := d.l2Engine.ForkchoiceUpdate(ctx, &fc, attrs)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrForkChoiceUpdated, err)
 	}
 	if res.PayloadStatus.Status != eth.ExecutionValid {
 		return nil, fmt.Errorf("%w: %s", ErrForkChoiceUpdatedNotValid, res.PayloadStatus.Status)

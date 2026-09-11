@@ -8,7 +8,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-core/forks"
 	"github.com/ethereum-optimism/optimism/op-core/predeploys"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/contractio"
@@ -42,12 +41,12 @@ func NewOperatorFee(t devtest.T, l2Network *L2Network, l1EL *L1ELNode) *Operator
 		bindings.WithTest(t))
 
 	l1Block := bindings.NewBindings[bindings.L1Block](
-		bindings.WithClient(l2Network.inner.L2ELNode(match.FirstL2EL).EthClient()),
+		bindings.WithClient(l2Network.PrimaryEL().EthClient()),
 		bindings.WithTo(predeploys.L1BlockAddr),
 		bindings.WithTest(t))
 
 	gasPriceOracle := bindings.NewBindings[bindings.GasPriceOracle](
-		bindings.WithClient(l2Network.inner.L2ELNode(match.FirstL2EL).EthClient()),
+		bindings.WithClient(l2Network.PrimaryEL().EthClient()),
 		bindings.WithTo(predeploys.GasPriceOracleAddr),
 		bindings.WithTest(t))
 
@@ -216,10 +215,9 @@ func (of *OperatorFee) RestoreOriginalConfig() {
 	of.SetOperatorFee(of.originalScalar, of.originalConstant)
 }
 
-func RunOperatorFeeTest(t devtest.T, l2Chain *L2Network, l1EL *L1ELNode, funderL1, funderL2 *Funder) {
+func RunOperatorFeeTest(t devtest.T, l2Chain *L2Network, l1EL *L1ELNode, funderL1, funderL2 *FunderEOA) {
 	fundAmount := eth.OneTenthEther
 	alice := funderL2.NewFundedEOA(fundAmount)
-	alice.WaitForBalance(fundAmount)
 	bob := funderL2.NewFundedEOA(eth.ZeroWei)
 
 	operatorFee := NewOperatorFee(t, l2Chain, l1EL)

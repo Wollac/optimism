@@ -10,6 +10,7 @@ import (
 
 	"math/big"
 
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/retry"
 	"github.com/ethereum/go-ethereum/common"
@@ -46,7 +47,7 @@ func getEthClientsFromL2Network(network *L2Network) ([]HeaderProvider, error) {
 	hps := make([]HeaderProvider, 0, len(stackNetwork.L2ELNodes()))
 	for _, n := range stackNetwork.L2ELNodes() {
 		ethClient := n.L2EthClient()
-		if !regexp.MustCompile(`snapsync-\d+$`).MatchString(n.ID().Key()) {
+		if !regexp.MustCompile(`snapsync-\d+$`).MatchString(n.Name()) {
 			hps = append(hps, ethClient)
 		}
 	}
@@ -176,7 +177,7 @@ func (mc *MultiClient) verifyFollowersWithRetry(
 		go func() {
 			defer wg.Done()
 			hash, err := retry.Do(ctx, mc.maxAttempts, mc.retryStrategy, func() (common.Hash, error) {
-				info, err := client.InfoByNumber(ctx, blockNum.Uint64())
+				info, err := client.InfoByNumber(ctx, bigs.Uint64Strict(blockNum))
 				if err != nil {
 					return common.Hash{}, err
 				}

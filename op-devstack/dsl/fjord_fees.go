@@ -7,8 +7,8 @@ import (
 
 	"github.com/ethereum-optimism/optimism/op-core/predeploys"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
 	"github.com/ethereum-optimism/optimism/op-service/apis"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/contractio"
@@ -47,7 +47,7 @@ func NewFjordFees(t devtest.T, l2Network *L2Network) *FjordFees {
 
 // ValidateTransaction validates the transaction and returns the validation result
 func (ff *FjordFees) ValidateTransaction(from *EOA, to *EOA, amount *big.Int) FjordFeesValidationResult {
-	client := ff.l2Network.inner.L2ELNode(match.FirstL2EL).EthClient()
+	client := ff.l2Network.PrimaryEL().EthClient()
 
 	startBalance := from.GetBalance()
 	vaultsBefore := ff.getVaultBalances(client)
@@ -147,7 +147,7 @@ func (ff *FjordFees) validateFjordFeatures(receipt *types.Receipt, l1Fee *big.In
 	ff.require.NotNil(receipt.L1Fee, "L1 fee should be present in Fjord")
 	ff.require.True(l1Fee.Cmp(big.NewInt(0)) > 0, "L1 fee should be greater than 0 in Fjord")
 
-	client := ff.l2Network.inner.L2ELNode(match.FirstL2EL).EthClient()
+	client := ff.l2Network.PrimaryEL().EthClient()
 
 	_, txs, err := client.InfoAndTxsByHash(ff.ctx, receipt.BlockHash)
 	ff.require.NoError(err)
@@ -325,7 +325,7 @@ func ReadGasPriceOracleL1FeeUpperBoundAt(ctx context.Context, client apis.EthCli
 func ValidateL1FeeMatches(t devtest.T, calculatedFee, receiptFee *big.Int) {
 	require := t.Require()
 	require.NotNil(receiptFee, "L1 fee should be present in receipt")
-	require.Equalf(calculatedFee.Uint64(), receiptFee.Uint64(), "L1 fee mismatch (expected=%d actual=%d)", calculatedFee.Uint64(), receiptFee.Uint64())
+	require.Equalf(bigs.Uint64Strict(calculatedFee), bigs.Uint64Strict(receiptFee), "L1 fee mismatch (expected=%v actual=%v)", calculatedFee, receiptFee)
 }
 
 // CalculateFjordL1Cost calculates L1 cost using Fjord formula with block-specific L1 state

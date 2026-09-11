@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import { Vm, VmSafe } from "forge-std/Vm.sol";
+import { LibString } from "@solady/utils/LibString.sol";
 
 /// @notice Enum representing different ways of outputting genesis allocs.
 /// @custom:value NONE    No output, used in internal tests.
@@ -37,10 +38,11 @@ enum Fork {
     HOLOCENE,
     ISTHMUS,
     JOVIAN,
-    INTEROP
+    KARST,
+    LAGOON
 }
 
-Fork constant LATEST_FORK = Fork.INTEROP;
+Fork constant LATEST_FORK = Fork.LAGOON;
 
 library ForkUtils {
     function toString(Fork _fork) internal pure returns (string memory) {
@@ -60,6 +62,8 @@ library ForkUtils {
             return "isthmus";
         } else if (_fork == Fork.JOVIAN) {
             return "jovian";
+        } else if (_fork == Fork.KARST) {
+            return "karst";
         } else {
             return "unknown";
         }
@@ -84,12 +88,8 @@ library Config {
 
     /// @notice Returns the path on the local filesystem where the deploy config is
     function deployConfigPath() internal view returns (string memory env_) {
-        if (vm.isContext(VmSafe.ForgeContext.TestGroup)) {
-            env_ = string.concat(vm.projectRoot(), "/deploy-config/hardhat.json");
-        } else {
-            env_ = vm.envOr("DEPLOY_CONFIG_PATH", string(""));
-            require(bytes(env_).length > 0, "Config: must set DEPLOY_CONFIG_PATH to filesystem path of deploy config");
-        }
+        env_ = vm.envOr("DEPLOY_CONFIG_PATH", string(""));
+        require(bytes(env_).length > 0, "Config: must set DEPLOY_CONFIG_PATH to filesystem path of deploy config");
     }
 
     /// @notice Returns the chainid from the EVM context or the value of the CHAIN_ID env var as
@@ -207,6 +207,8 @@ library Config {
             return Fork.ISTHMUS;
         } else if (forkHash == keccak256(bytes("jovian"))) {
             return Fork.JOVIAN;
+        } else if (forkHash == keccak256(bytes("karst"))) {
+            return Fork.KARST;
         } else {
             revert(string.concat("Config: unknown fork: ", forkStr));
         }
@@ -261,14 +263,67 @@ library Config {
         return vm.envOr("FOUNDRY_PROFILE", string("default"));
     }
 
+    /// @notice Returns true when the compiler output is not production-like. This includes
+    ///         coverage mode (which adds instrumentation) and unoptimized Foundry profiles
+    ///         (which produce different bytecode, CREATE2 addresses, and gas costs).
+    function isUnoptimized() internal view returns (bool) {
+        if (vm.isContext(VmSafe.ForgeContext.Coverage)) {
+            return true;
+        }
+        string memory profile = foundryProfile();
+        return !LibString.eq(profile, "default") && !LibString.eq(profile, "ci");
+    }
+
     /// @notice Returns the path to the superchain ops allocs.
     function superchainOpsAllocsPath() internal view returns (string memory) {
         return vm.envOr("SUPERCHAIN_OPS_ALLOCS_PATH", string(""));
     }
 
     /// @notice Returns true if the fork is a test fork.
-    function forkTest() internal view returns (bool) {
+    function l1ForkTest() internal view returns (bool) {
         return vm.envOr("FORK_TEST", false);
+    }
+
+    /// @notice Returns true if this is an L2 fork test.
+    function l2ForkTest() internal view returns (bool) {
+        return vm.envOr("L2_FORK_TEST", false);
+    }
+
+    /// @notice Returns true if this is a L2CM activation test.
+    function l2CMActivationTest() internal view returns (bool) {
+        return vm.envOr("L2CM_ACTIVATION_TEST", false);
+    }
+
+    /// @notice Returns the L2 RPC URL for forking.
+    function l2ForkRpcUrl() internal view returns (string memory) {
+        return vm.envString("L2_FORK_RPC_URL");
+    }
+
+    /// @notice Returns the L2 block after the fork.
+    function l2BlockAfterFork() internal view returns (uint256) {
+        if (l2CMActivationTest()) {
+            return vm.envOr("L2_FORK_BLOCK_NUMBER", uint256(0));
+        }
+        revert("Config: l2BlockAfterFork called outside of L2CM activation test");
+    }
+
+    /// @notice Returns the path to the committed NUT bundle JSON to verify against.
+    function nutBundlePath() internal view returns (string memory) {
+        return vm.envString("NUT_BUNDLE_PATH");
+    }
+
+    /// @notice Returns the L2 block number to fork at. Defaults to 0 (latest).
+    ///         If L2CM activation test is enabled, returns the block before the fork.
+    function l2ForkBlockNumber() internal view returns (uint256) {
+        if (l2CMActivationTest()) {
+            return vm.envUint("L2_BLOCK_BEFORE_FORK");
+        }
+        return vm.envOr("L2_FORK_BLOCK_NUMBER", uint256(0));
+    }
+
+    /// @notice Returns the L2 chain identifier (e.g., "op", "base", "mode").
+    function l2ForkChain() internal view returns (string memory) {
+        return vm.envOr("L2_FORK_CHAIN", string("op"));
     }
 
     /// @notice Returns true if the development feature interop is enabled.
@@ -276,23 +331,24 @@ library Config {
         return vm.envOr("DEV_FEATURE__OPTIMISM_PORTAL_INTEROP", false);
     }
 
-    /// @notice Returns true if the development feature cannon_kona is enabled.
-    function devFeatureCannonKona() internal view returns (bool) {
-        return vm.envOr("DEV_FEATURE__CANNON_KONA", false);
+    /// @notice Returns true if the development feature ZK_DISPUTE_GAME is enabled.
+    function devFeatureZkDisputeGame() internal view returns (bool) {
+        return vm.envOr("DEV_FEATURE__ZK_DISPUTE_GAME", false);
     }
 
-    /// @notice Returns true if the development feature deploy_v2_dispute_games is enabled.
-    function devFeatureDeployV2DisputeGames() internal view returns (bool) {
-        return vm.envOr("DEV_FEATURE__DEPLOY_V2_DISPUTE_GAMES", false);
+    /// @notice Returns true if the development feature super root games migration is enabled.
+    /// @dev Defaults to true: SUPER_ROOT_GAMES_MIGRATION is the default OPCM migration codepath. See TODO(#21662).
+    function devFeatureSuperRootGamesMigration() internal pure returns (bool) {
+        return true;
     }
 
-    /// @notice Returns true if the development feature custom gas token is enabled.
-    function devFeatureCustomGasToken() internal view returns (bool) {
-        return vm.envOr("DEV_FEATURE__CUSTOM_GAS_TOKEN", false);
+    /// @notice Returns true if the system feature custom_gas_token is enabled.
+    function sysFeatureCustomGasToken() internal view returns (bool) {
+        return vm.envOr("SYS_FEATURE__CUSTOM_GAS_TOKEN", false);
     }
 
-    /// @notice Returns true if the development feature opcm_v2 is enabled.
-    function devFeatureOpcmV2() internal view returns (bool) {
-        return vm.envOr("DEV_FEATURE__OPCM_V2", false);
+    /// @notice Returns true if running in kontrol context.
+    function isKontrolContext() internal view returns (bool) {
+        return vm.envOr("KONTROL_CONTEXT", false);
     }
 }

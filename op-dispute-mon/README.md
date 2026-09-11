@@ -7,7 +7,7 @@ The `op-dispute-mon` is an off-chain service to monitor dispute games.
 Clone this repo. Then run:
 
 ```shell
-make op-dispute-mon
+just op-dispute-mon
 ```
 
 This will build the `op-dispute-mon` binary which can be run with
@@ -26,10 +26,10 @@ shows the available config options and can be accessed by running `./bin/op-disp
   --l1-eth-rpc <L1-Ethereum-RPC-URL> \
   --rollup-rpc <Optimism-Rollup-RPC-URL>,<Secondary-RPC-URL>,<Tertiary-RPC-URL>
 
-# For networks using op-supervisor:
+# For networks using super root RPCs:
 ./bin/op-dispute-mon \
   --network <Predefined-Network> \
   --l1-eth-rpc <L1-Ethereum-RPC-URL> \
-  --supervisor-rpc <Supervisor-RPC-URL>,<Secondary-RPC-URL>,<Tertiary-RPC-URL>
+  --superroot-rpc <SuperRoot-RPC-URL>,<Secondary-RPC-URL>,<Tertiary-RPC-URL>
 
 ```

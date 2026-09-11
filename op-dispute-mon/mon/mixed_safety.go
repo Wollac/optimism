@@ -21,15 +21,15 @@ func NewMixedSafetyMonitor(logger log.Logger, metrics MixedSafetyMetrics) *Mixed
 	}
 }
 
-func (m *MixedSafetyMonitor) CheckMixedSafety(games []*types.EnrichedGameData) {
+func (m *MixedSafetyMonitor) CheckMixedSafety(games []*types.CommonGameData) {
 	count := 0
 	for _, game := range games {
 		if game.HasMixedSafety() {
 			count++
 			m.logger.Debug("Mixed safety detected",
 				"game", game.Proxy,
-				"safeCount", game.RollupEndpointSafeCount,
-				"unsafeCount", game.RollupEndpointUnsafeCount)
+				"safeCount", game.NodeEndpointSafeCount,
+				"unsafeCount", game.NodeEndpointUnsafeCount)
 		}
 	}
 

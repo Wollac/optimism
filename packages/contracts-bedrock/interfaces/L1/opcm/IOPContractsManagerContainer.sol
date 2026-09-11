@@ -8,18 +8,12 @@ interface IOPContractsManagerContainer {
         address proxyAdmin;
         address l1ChugSplashProxy;
         address resolvedDelegateProxy;
-        address permissionedDisputeGame1;
-        address permissionedDisputeGame2;
-        address permissionlessDisputeGame1;
-        address permissionlessDisputeGame2;
     }
 
     struct Implementations {
         address superchainConfigImpl;
-        address protocolVersionsImpl;
         address l1ERC721BridgeImpl;
         address optimismPortalImpl;
-        address optimismPortalInteropImpl;
         address ethLockboxImpl;
         address systemConfigImpl;
         address optimismMintableERC20FactoryImpl;
@@ -29,14 +23,16 @@ interface IOPContractsManagerContainer {
         address anchorStateRegistryImpl;
         address delayedWETHImpl;
         address mipsImpl;
-        address faultDisputeGameV2Impl;
-        address permissionedDisputeGameV2Impl;
+        address faultDisputeGameImpl;
+        address permissionedDisputeGameImpl;
         address superFaultDisputeGameImpl;
         address superPermissionedDisputeGameImpl;
+        address zkDisputeGameImpl;
         address storageSetterImpl;
+        address sp1PlonkAdapterImpl;
     }
 
-    error OPContractsManagerContractsContainer_DevFeatureInProd();
+    error OPContractsManagerContainer_DevFeatureInProd();
 
     function blueprints() external view returns (Blueprints memory);
     function implementations() external view returns (Implementations memory);

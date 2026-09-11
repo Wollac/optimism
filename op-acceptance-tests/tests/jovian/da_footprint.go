@@ -16,31 +16,36 @@ import (
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
-	"github.com/ethereum-optimism/optimism/op-service/txinclude"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/contractio"
 	"github.com/ethereum-optimism/optimism/op-service/txplan"
 
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-type CalldataSpammer struct {
-	eoa *loadtest.SyncEOA
-}
+func SpamCalldata(t devtest.T, l2BlockTime time.Duration, el *dsl.L2ELNode, wallet *dsl.HDWallet, funder *dsl.FunderEOA) {
+	eoas := loadtest.FundEOAs(t, eth.HundredEther, 25, l2BlockTime, el, wallet, funder)
+	rr := loadtest.NewRoundRobin(eoas)
 
-func NewCalldataSpammer(eoa *loadtest.SyncEOA) *CalldataSpammer {
-	return &CalldataSpammer{
-		eoa: eoa,
-	}
-}
-
-func (s *CalldataSpammer) Spam(t devtest.T) error {
-	data := make([]byte, 50_000)
-	_, err := rand.Read(data)
-	t.Require().NoError(err)
-	_, err = s.eoa.Include(t, txplan.WithTo(&common.Address{}), txplan.WithData(data))
-	return err
+	ctx, cancel := context.WithCancel(t.Ctx())
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		loadtest.NewBurst(l2BlockTime).Run(t.WithCtx(ctx), loadtest.SpammerFunc(func(t devtest.T) error {
+			data := make([]byte, 50_000)
+			_, err := rand.Read(data)
+			t.Require().NoError(err)
+			_, err = rr.Get().Include(t, txplan.WithTo(&common.Address{}), txplan.WithData(data))
+			return err
+		}))
+	}()
 }
 
 type daFootprintSystemConfig struct {
@@ -117,7 +122,7 @@ func (env *daFootprintEnv) expectL1BlockDAFootprintGasScalar(t devtest.T, expect
 }
 
 func TestDAFootprint(gt *testing.T) {
-	t := devtest.SerialT(gt)
+	t := devtest.ParallelT(gt)
 	sys := presets.NewMinimal(t)
 	require := t.Require()
 
@@ -153,7 +158,7 @@ func TestDAFootprint(gt *testing.T) {
 				// Retrying up to 100 times is overkill, but lower values may not work on
 				// persistent networks. See the following issue for more details.
 				// https://github.com/ethereum-optimism/optimism/issues/18061
-				env.l2EL.WaitL1OriginReached(eth.Unsafe, rec.BlockNumber.Uint64(), 100)
+				env.l2EL.WaitL1OriginReached(eth.Unsafe, bigs.Uint64Strict(rec.BlockNumber), 100)
 			} else {
 				scalar := env.getDAFootprintGasScalarOfSystemConfig(t)
 				if scalar != 0 {
@@ -163,26 +168,7 @@ func TestDAFootprint(gt *testing.T) {
 			}
 			env.expectL1BlockDAFootprintGasScalar(t, tc.expected)
 
-			var wg sync.WaitGroup
-			defer wg.Wait()
-
-			ctx, cancel := context.WithTimeout(t.Ctx(), time.Minute)
-			defer cancel()
-			t = t.WithCtx(ctx)
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				eoa := sys.FunderL2.NewFundedEOA(eth.OneTenthEther)
-				includer := txinclude.NewPersistent(txinclude.NewPkSigner(eoa.Key().Priv(), eoa.ChainID().ToBig()), struct {
-					*txinclude.Resubmitter
-					*txinclude.Monitor
-				}{
-					txinclude.NewResubmitter(ethClient, l2BlockTime),
-					txinclude.NewMonitor(ethClient, l2BlockTime),
-				})
-				loadtest.NewBurst(l2BlockTime).Run(t, NewCalldataSpammer(loadtest.NewSyncEOA(includer, eoa.Plan())))
-			}()
+			SpamCalldata(t, l2BlockTime, sys.L2EL, sys.Wallet, sys.FunderL2)
 
 			rollupCfg := sys.L2Chain.Escape().RollupConfig()
 			gasTarget := rollupCfg.Genesis.SystemConfig.GasLimit / rollupCfg.ChainOpConfig.EIP1559Elasticity
@@ -220,7 +206,7 @@ func TestDAFootprint(gt *testing.T) {
 				require.NotNil(recScalar, "nil receipt DA footprint gas scalar")
 				require.EqualValues(tc.expected, *recScalar, "DA footprint gas scalar mismatch in receipt")
 
-				txDAFootprint := tx.RollupCostData().EstimatedDASize().Uint64() * uint64(tc.expected)
+				txDAFootprint := bigs.Uint64Strict(tx.RollupCostData().EstimatedDASize()) * uint64(tc.expected)
 				require.Equal(txDAFootprint, receipts[i].BlobGasUsed, "tx DA footprint mismatch with receipt")
 				totalDAFootprint += txDAFootprint
 			}

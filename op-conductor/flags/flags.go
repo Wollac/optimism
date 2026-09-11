@@ -91,22 +91,28 @@ var (
 		Usage:   "HTTP provider URL for execution layer",
 		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "EXECUTION_RPC"),
 	}
-	SupervisorRPC = &cli.StringFlag{
-		Name:    "supervisor.rpc",
-		Usage:   "HTTP provider URL for supervisor",
-		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "SUPERVISOR_RPC"),
-	}
 	RollupBoostEnabled = &cli.BoolFlag{
 		Name:    "rollup-boost.enabled",
-		Usage:   "Should be set to true if execution.rpc points to a rollup boost instance, false otherwise. If true, rollup boost specific healthchecks will be performed against the rollup boost instance.",
+		Usage:   "Enable the rollup-boost healthcheck that uses HTTP status codes (200/206/503). Healthchecks are performed against execution.rpc + '/healthz' (path appended automatically). Mutually exclusive with rollup-boost.next-enabled.",
 		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "ROLLUP_BOOST_ENABLED"),
 		Value:   false,
 	}
 	RollupBoostHealthcheckTimeout = &cli.DurationFlag{
 		Name:    "rollup-boost.healthcheck-timeout",
-		Usage:   "Timeout for rollup boost healthcheck",
+		Usage:   "Timeout for rollup-boost healthchecks (applies to both standard and next)",
 		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "ROLLUP_BOOST_HEALTHCHECK_TIMEOUT"),
 		Value:   5 * time.Second,
+	}
+	RollupBoostNextEnabled = &cli.BoolFlag{
+		Name:    "rollup-boost.next-enabled",
+		Usage:   "Enable rollup-boost healthcheck using JSON response parsing. Requires rollup-boost.next-healthcheck-url. Mutually exclusive with rollup-boost.enabled.",
+		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "ROLLUP_BOOST_NEXT_ENABLED"),
+		Value:   false,
+	}
+	RollupBoostNextHealthcheckURL = &cli.StringFlag{
+		Name:    "rollup-boost.next-healthcheck-url",
+		Usage:   "Full URL including path for the rollup-boost health endpoint (e.g., 'http://localhost:8080/healthz'). Required when rollup-boost.next-enabled is true.",
+		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "ROLLUP_BOOST_NEXT_HEALTHCHECK_URL"),
 	}
 	HealthCheckInterval = &cli.Uint64Flag{
 		Name:    "healthcheck.interval",
@@ -190,6 +196,20 @@ var (
 		Usage:   "The time frame within which rollup-boost partial healthiness tolerance is evaluated",
 		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "HEALTHCHECK_ROLLUP_BOOST_PARTIAL_HEALTHINESS_TOLERANCE_INTERVAL_SECONDS"),
 	}
+	// RoundRobinLeaderTransfer enables deterministic round-robin leader transfer.
+	// When enabled, leader transfer will cycle through all voters in sorted order (by ServerID),
+	// ensuring that even if only one node in the cluster is healthy, it will eventually become leader.
+	// This is useful when Raft's default log-based leader selection keeps choosing unhealthy nodes.
+	//
+	// NOTE: This flag must be enabled on ALL conductors in the cluster to work as intended.
+	// A mixed configuration (some nodes enabled, some disabled) can cause a leadership bounce loop
+	// between round-robin and log-based selection strategies.
+	RoundRobinLeaderTransfer = &cli.BoolFlag{
+		Name:    "raft.round-robin-leader-transfer",
+		Usage:   "Enable deterministic round-robin leader transfer instead of Raft's default log-based selection. Must be enabled on all conductors in the cluster.",
+		EnvVars: opservice.PrefixEnvVar(EnvVarPrefix, "RAFT_ROUND_ROBIN_LEADER_TRANSFER"),
+		Value:   false,
+	}
 )
 
 var requiredFlags = []cli.Flag{
@@ -216,15 +236,17 @@ var optionalFlags = []cli.Flag{
 	RaftTrailingLogs,
 	RaftHeartbeatTimeout,
 	RaftLeaderLeaseTimeout,
-	SupervisorRPC,
 	RollupBoostEnabled,
 	RollupBoostHealthcheckTimeout,
+	RollupBoostNextEnabled,
+	RollupBoostNextHealthcheckURL,
 	HealthcheckExecutionP2pEnabled,
 	HealthcheckExecutionP2pMinPeerCount,
 	HealthcheckExecutionP2pRPCUrl,
 	HealthcheckExecutionP2pCheckApi,
 	HealthCheckRollupBoostPartialHealthinessToleranceLimit,
 	HealthCheckRollupBoostPartialHealthinessToleranceIntervalSeconds,
+	RoundRobinLeaderTransfer,
 }
 
 func init() {

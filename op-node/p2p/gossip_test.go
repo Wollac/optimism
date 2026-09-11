@@ -3,6 +3,7 @@ package p2p
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"io"
 	"math/big"
@@ -12,6 +13,7 @@ import (
 	"github.com/golang/snappy"
 
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
+	"github.com/ethereum-optimism/optimism/op-service/clock"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/ptr"
 	opsigner "github.com/ethereum-optimism/optimism/op-service/signer"
@@ -99,6 +101,46 @@ func TestVerifyBlockSignature(t *testing.T) {
 		result := verifyBlockSignature(logger, cfg, runCfg, peerId, sig, msg)
 		require.Equal(t, pubsub.ValidationIgnore, result)
 	})
+
+	// Grace period tests: when the signer rotates, blocks from the previous signer
+	// should still be accepted during the grace period.
+	newSecrets, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	thirdSecrets, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	secretsAddr := crypto.PubkeyToAddress(secrets.PublicKey)
+	newAddr := crypto.PubkeyToAddress(newSecrets.PublicKey)
+
+	gracePeriodTests := []struct {
+		name        string
+		current     common.Address
+		prev        common.Address
+		signWith    *ecdsa.PrivateKey
+		wantResult  pubsub.ValidationResult
+		wantConfirm bool
+	}{
+		{"PreviousSignerAccepted", newAddr, secretsAddr, secrets, pubsub.ValidationAccept, false},
+		{"NewSignerConfirms", newAddr, secretsAddr, newSecrets, pubsub.ValidationAccept, true},
+		{"GracePeriodExpired", newAddr, common.Address{}, secrets, pubsub.ValidationReject, false},
+		{"ThirdPartySignerRejected", newAddr, secretsAddr, thirdSecrets, pubsub.ValidationReject, false},
+		{"ValidNoGracePeriod", secretsAddr, common.Address{}, secrets, pubsub.ValidationAccept, true},
+	}
+
+	for _, tc := range gracePeriodTests {
+		t.Run(tc.name, func(t *testing.T) {
+			runCfg := &testutils.MockRuntimeConfig{
+				P2PSeqAddress:     tc.current,
+				PrevP2PSeqAddress: tc.prev,
+			}
+			signer := &PreparedSigner{Signer: opsigner.NewLocalSigner(tc.signWith)}
+			sig, err := signer.SignBlockV1(context.Background(), eth.ChainIDFromBig(cfg.L2ChainID), opsigner.PayloadHash(msg))
+			require.NoError(t, err)
+			result := verifyBlockSignature(logger, cfg, runCfg, peerId, sig, msg)
+			require.Equal(t, tc.wantResult, result)
+			require.Equal(t, tc.wantConfirm, runCfg.Confirmed)
+		})
+	}
 }
 
 type MarshalSSZ interface {
@@ -156,14 +198,14 @@ func TestBlockValidator(t *testing.T) {
 
 	// Create a mock gossip configuration for testing
 	mockGossipConf := &mockGossipSetupConfigurablesWithThreshold{threshold: 60 * time.Second}
-	v2Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV2, mockGossipConf)
-	v3Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV3, mockGossipConf)
-	v4Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelDebug), cfg, runCfg, eth.BlockV4, mockGossipConf)
+	v2Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV2, mockGossipConf, clock.SystemClock)
+	v3Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV3, mockGossipConf, clock.SystemClock)
+	v4Validator := BuildBlocksValidator(testlog.Logger(t, log.LevelDebug), cfg, runCfg, eth.BlockV4, mockGossipConf, clock.SystemClock)
 	jovianCfg := &rollup.Config{
 		L2ChainID:  big.NewInt(100),
 		JovianTime: ptr.New(uint64(0)),
 	}
-	v4JovianValidator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), jovianCfg, runCfg, eth.BlockV4, mockGossipConf)
+	v4JovianValidator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), jovianCfg, runCfg, eth.BlockV4, mockGossipConf, clock.SystemClock)
 
 	zero, one := uint64(0), uint64(1)
 	beaconHash, withdrawalsRoot := common.HexToHash("0x1234"), common.HexToHash("0x9876")
@@ -263,7 +305,7 @@ func TestGossipTimestampThreshold(t *testing.T) {
 			mockConfig := &mockGossipSetupConfigurablesWithThreshold{threshold: tc.threshold}
 
 			// Create validator with the mock config
-			validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV2, mockConfig)
+			validator := BuildBlocksValidator(testlog.Logger(t, log.LevelCrit), cfg, runCfg, eth.BlockV2, mockConfig, clock.SystemClock)
 
 			// Create payload with the specific timestamp
 			payload := createExecutionPayload(types.Withdrawals{}, nil, nil, nil)

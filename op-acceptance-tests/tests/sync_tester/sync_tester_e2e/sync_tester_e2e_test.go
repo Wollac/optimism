@@ -7,11 +7,12 @@ import (
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
-	"github.com/ethereum-optimism/optimism/op-supervisor/supervisor/types"
+
+	safety "github.com/ethereum-optimism/optimism/op-service/eth/safety"
 )
 
 func TestSyncTesterE2E(gt *testing.T) {
-	t := devtest.SerialT(gt)
+	t := devtest.ParallelT(gt)
 	// This test uses DefaultSimpleSystemWithSyncTester which includes:
 	// - Minimal setup with L1EL, L1CL, L2EL, L2CL (sequencer)
 	// - Additional L2CL2 (verifier) that connects to SyncTester instead of L2EL
@@ -21,10 +22,10 @@ func TestSyncTesterE2E(gt *testing.T) {
 	ctx := t.Ctx()
 
 	// Test that we can get chain IDs from both L2CL nodes
-	l2CLChainID := sys.L2CL.ID().ChainID()
+	l2CLChainID := sys.L2CL.ChainID()
 	require.Equal(eth.ChainIDFromUInt64(901), l2CLChainID, "first L2CL should be on chain 901")
 
-	l2CL2ChainID := sys.L2CL2.ID().ChainID()
+	l2CL2ChainID := sys.L2CL2.ChainID()
 	require.Equal(eth.ChainIDFromUInt64(901), l2CL2ChainID, "second L2CL should be on chain 901")
 
 	// Test that the network started successfully
@@ -47,8 +48,8 @@ func TestSyncTesterE2E(gt *testing.T) {
 
 	target := uint64(5)
 	dsl.CheckAll(t,
-		sys.L2CL.AdvancedFn(types.LocalUnsafe, target, 30),
-		sys.L2CL2.AdvancedFn(types.LocalUnsafe, target, 30),
+		sys.L2CL.AdvancedFn(safety.LocalUnsafe, target, 30),
+		sys.L2CL2.AdvancedFn(safety.LocalUnsafe, target, 30),
 	)
 
 	// Test that we can get chain ID from SyncTester

@@ -2,9 +2,10 @@ package helpers
 
 import (
 	"errors"
+	"os"
 
+	"github.com/ethereum-optimism/optimism/op-e2e/actions/helpers/engineapi"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils"
-	"github.com/ethereum-optimism/optimism/op-program/client/l2/engineapi"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/stretchr/testify/require"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/client"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
 	"github.com/ethereum-optimism/optimism/op-service/testutils"
@@ -75,10 +77,14 @@ func NewL2Engine(t Testing, log log.Logger, genesis *core.Genesis, jwtPath strin
 
 func newBackend(t e2eutils.TestingBase, genesis *core.Genesis, jwtPath string, options []EngineOption) (*node.Node, *geth.Ethereum, *engineApiBackend) {
 	ethCfg := &ethconfig.Config{
-		NetworkId:   genesis.Config.ChainID.Uint64(),
+		NetworkId:   bigs.Uint64Strict(genesis.Config.ChainID),
 		Genesis:     genesis,
 		StateScheme: rawdb.HashScheme,
 		NoPruning:   true,
+		// Record trie-key preimages when generating pre-fork state artifacts, so
+		// the post-activation state can be enumerated and dumped. Off otherwise to
+		// avoid the recording overhead in normal test runs.
+		Preimages: os.Getenv("OP_E2E_GEN_PREFORK_STATE") != "",
 	}
 	nodeCfg := &node.Config{
 		Name:        "l2-geth",

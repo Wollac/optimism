@@ -21,8 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils"
-	"github.com/ethereum-optimism/optimism/op-program/client/l2/engineapi"
-	"github.com/ethereum-optimism/optimism/op-program/client/l2/engineapi/test"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
@@ -202,7 +201,7 @@ func TestL2EngineAPIBlockBuilding(gt *testing.T) {
 	require.Equal(gt, 1, engine.l2Chain.GetBlockByHash(engine.l2Chain.CurrentBlock().Hash()).Transactions().Len(), "tx from alice is included")
 	buildBlock(false)
 	require.Zero(t, engine.l2Chain.GetBlockByHash(engine.l2Chain.CurrentBlock().Hash()).Transactions().Len(), "no tx included")
-	require.Equal(t, uint64(3), engine.l2Chain.CurrentBlock().Number.Uint64(), "built 3 blocks")
+	require.Equal(t, uint64(3), bigs.Uint64Strict(engine.l2Chain.CurrentBlock().Number), "built 3 blocks")
 }
 
 func TestL2EngineAPIFail(gt *testing.T) {
@@ -223,16 +222,4 @@ func TestL2EngineAPIFail(gt *testing.T) {
 	head, err := l2Cl.InfoByLabel(t.Ctx(), eth.Unsafe)
 	require.NoError(t, err)
 	require.Equal(gt, sd.L2Cfg.ToBlock().Hash(), head.Hash(), "expecting engine to start at genesis")
-}
-
-func TestEngineAPITests(t *testing.T) {
-	test.RunEngineAPITests(t, func(t *testing.T) engineapi.EngineBackend {
-		jwtPath := e2eutils.WriteDefaultJWT(t)
-		dp := e2eutils.MakeDeployParams(t, DefaultRollupTestParams())
-		sd := e2eutils.Setup(t, dp, DefaultAlloc)
-		n, _, apiBackend := newBackend(t, sd.L2Cfg, jwtPath, nil)
-		err := n.Start()
-		require.NoError(t, err)
-		return apiBackend
-	})
 }

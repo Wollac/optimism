@@ -17,7 +17,9 @@ import (
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl/contract"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/wait"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
+	"github.com/ethereum-optimism/optimism/op-service/txintent/contractio"
 	"github.com/ethereum-optimism/optimism/op-service/txplan"
 )
 
@@ -53,27 +55,49 @@ func NewFaultDisputeGame(
 	return fdg
 }
 
-func (g *FaultDisputeGame) GameType() challengerTypes.GameType {
-	return challengerTypes.GameType(contract.Read(g.game.GameType()))
+func (g *FaultDisputeGame) GameType() gameTypes.GameType {
+	return gameTypes.GameType(contract.Read(g.game.GameType()))
+}
+
+func (g *FaultDisputeGame) VerifyGameType(expected gameTypes.GameType) {
+	actual := g.GameType()
+	g.require.Equalf(expected, actual,
+		"game type mismatch: expected %s (%d), got %s (%d)",
+		expected, uint32(expected), actual, uint32(actual))
 }
 
 func (g *FaultDisputeGame) MaxDepth() challengerTypes.Depth {
-	return challengerTypes.Depth(contract.Read(g.game.MaxGameDepth()).Uint64())
+	return challengerTypes.Depth(bigs.Uint64Strict(contract.Read(g.game.MaxGameDepth())))
 }
 
 func (g *FaultDisputeGame) SplitDepth() challengerTypes.Depth {
-	return challengerTypes.Depth(contract.Read(g.game.SplitDepth()).Uint64())
+	return challengerTypes.Depth(bigs.Uint64Strict(contract.Read(g.game.SplitDepth())))
+}
+
+func (g *FaultDisputeGame) MaxClockDuration() time.Duration {
+	return time.Duration(contract.Read(g.game.MaxClockDuration())) * time.Second
+}
+
+func (g *FaultDisputeGame) CreatedAt() uint64 {
+	return contract.Read(g.game.CreatedAt())
 }
 
 func (g *FaultDisputeGame) RootClaim() *Claim {
 	return g.ClaimAtIndex(0)
 }
 
+func (g *FaultDisputeGame) RootClaimValue() common.Hash {
+	return contract.Read(g.game.RootClaim())
+}
+
 func (g *FaultDisputeGame) L2SequenceNumber() uint64 {
-	return contract.Read(g.game.L2SequenceNumber()).Uint64()
+	return bigs.Uint64Strict(contract.Read(g.game.L2SequenceNumber()))
 }
 
 func (g *FaultDisputeGame) StartingL2SequenceNumber() uint64 {
+	if g.GameType() == gameTypes.SuperCannonKonaGameType {
+		return contract.Read(g.game.StartingSequenceNumber())
+	}
 	return contract.Read(g.game.StartingBlockNumber())
 }
 
@@ -88,6 +112,10 @@ func (g *FaultDisputeGame) absolutePrestate() common.Hash {
 
 func (g *FaultDisputeGame) L1Head() common.Hash {
 	return contract.Read(g.game.L1Head())
+}
+
+func (g *FaultDisputeGame) WETHAddress() common.Address {
+	return contract.Read(g.game.Weth())
 }
 
 func (g *FaultDisputeGame) Attack(eoa *dsl.EOA, claimIdx uint64, newClaim common.Hash) {
@@ -115,6 +143,19 @@ func (g *FaultDisputeGame) Defend(eoa *dsl.EOA, claimIdx uint64, newClaim common
 	g.t.Require().Equal(receipt.Status, types.ReceiptStatusSuccessful)
 }
 
+func (g *FaultDisputeGame) ResolveClaim(eoa *dsl.EOA, claimIdx uint64) {
+	g.t.Logf("Resolving claim %v in game %v with actor %v", claimIdx, g.Address, eoa.Address())
+	resolveCall := g.game.ResolveClaim(new(big.Int).SetUint64(claimIdx), common.Big0)
+	receipt := contract.Write(eoa, resolveCall, txplan.WithGasRatio(2))
+	g.require.Equal(types.ReceiptStatusSuccessful, receipt.Status)
+}
+
+func (g *FaultDisputeGame) Resolve(eoa *dsl.EOA) {
+	g.t.Logf("Resolving game %v with actor %v", g.Address, eoa.Address())
+	receipt := contract.Write(eoa, g.game.Resolve(), txplan.WithGasRatio(2))
+	g.require.Equal(types.ReceiptStatusSuccessful, receipt.Status)
+}
+
 func (g *FaultDisputeGame) PerformMoves(eoa *dsl.EOA, moves ...GameHelperMove) []*Claim {
 	return g.helperProvider(eoa).PerformMoves(eoa, g, moves)
 }
@@ -131,9 +172,33 @@ func (g *FaultDisputeGame) requiredBond(pos challengerTypes.Position) eth.ETH {
 	return eth.WeiBig(contract.Read(g.game.GetRequiredBond((*bindings.Uint128)(pos.ToGIndex()))))
 }
 
+func (g *FaultDisputeGame) readStatus(ctx context.Context) (gameTypes.GameStatus, error) {
+	status, err := contractio.Read(g.game.Status(), ctx)
+	return gameTypes.GameStatus(status), err
+}
+
 func (g *FaultDisputeGame) status() gameTypes.GameStatus {
 	status := contract.Read(g.game.Status())
 	return gameTypes.GameStatus(status)
+}
+
+func (g *FaultDisputeGame) WaitForGameStatus(expected gameTypes.GameStatus) {
+	g.t.Logf("Waiting for game %v to have status %v", g.Address, expected)
+	timedCtx, cancel := context.WithTimeout(g.t.Ctx(), defaultTimeout)
+	defer cancel()
+
+	var actual gameTypes.GameStatus
+	var lastReadErr error
+	err := wait.For(timedCtx, time.Second, func() (bool, error) {
+		actual, lastReadErr = g.readStatus(timedCtx)
+		if lastReadErr != nil {
+			g.t.Logf("Game %v status unavailable while waiting for %v: %v", g.Address, expected, lastReadErr)
+			return false, nil
+		}
+		g.t.Logf("Game %v has status %v, waiting for %v", g.Address, actual, expected)
+		return actual == expected, nil
+	})
+	g.require.NoErrorf(err, "game %v status mismatch: expected %s, got %s; last read error: %v", g.Address, expected, actual, lastReadErr)
 }
 
 func (g *FaultDisputeGame) newClaim(claimIndex uint64, claim bindings.Claim) *Claim {
@@ -159,7 +224,7 @@ func (g *FaultDisputeGame) allClaims() []bindings.Claim {
 }
 
 func (g *FaultDisputeGame) claimCount() uint64 {
-	return contract.Read(g.game.ClaimDataLen()).Uint64()
+	return bigs.Uint64Strict(contract.Read(g.game.ClaimDataLen()))
 }
 
 func (g *FaultDisputeGame) waitForClaim(timeout time.Duration, errorMsg string, predicate func(claimIdx uint64, claim bindings.Claim) bool) (uint64, bindings.Claim) {

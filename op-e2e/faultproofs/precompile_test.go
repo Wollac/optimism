@@ -9,12 +9,13 @@ import (
 	"math/big"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/ethereum-optimism/optimism/op-e2e/actions/proofs"
 	e2e_config "github.com/ethereum-optimism/optimism/op-e2e/config"
 	"github.com/ethereum-optimism/optimism/op-e2e/system/e2esys"
 	"github.com/ethereum-optimism/optimism/op-e2e/system/helpers"
+	"github.com/ethereum-optimism/optimism/rust/kona/tests/proofs"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/challenger"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/disputegame"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/wait"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
 )
 
@@ -59,7 +61,7 @@ func TestPrecompile(t *testing.T) {
 		t.Log("Capture current L2 head as agreed starting point")
 		latestBlock, err := l2Seq.BlockByNumber(ctx, nil)
 		require.NoError(t, err)
-		agreedL2Output, err := rollupClient.OutputAtBlock(ctx, latestBlock.NumberU64())
+		agreedL2Output, err := wait.ForOutputAtBlock(ctx, rollupClient, latestBlock.NumberU64())
 		require.NoError(t, err, "could not retrieve l2 agreed block")
 		l2Head := agreedL2Output.BlockRef.Hash
 		l2OutputRoot := agreedL2Output.OutputRoot
@@ -73,12 +75,12 @@ func TestPrecompile(t *testing.T) {
 
 		t.Log("Determine L2 claim")
 		l2ClaimBlockNumber := receipt.BlockNumber
-		l2Output, err := rollupClient.OutputAtBlock(ctx, l2ClaimBlockNumber.Uint64())
+		l2Output, err := wait.ForOutputAtBlock(ctx, rollupClient, bigs.Uint64Strict(l2ClaimBlockNumber))
 		require.NoError(t, err, "could not get expected output")
 		l2Claim := l2Output.OutputRoot
 
 		t.Log("Determine L1 head that includes all batches required for L2 claim block")
-		require.NoError(t, wait.ForSafeBlock(ctx, rollupClient, l2ClaimBlockNumber.Uint64()))
+		require.NoError(t, wait.ForSafeBlock(ctx, rollupClient, bigs.Uint64Strict(l2ClaimBlockNumber)))
 		l1HeadBlock, err := l1Client.BlockByNumber(ctx, nil)
 		require.NoError(t, err, "get l1 head block")
 		l1Head := l1HeadBlock.Hash()
@@ -116,7 +118,7 @@ func TestDisputePrecompile(t *testing.T) {
 		})
 
 		disputeGameFactory := disputegame.NewFactoryHelper(t, ctx, sys)
-		game := disputeGameFactory.StartOutputCannonGame(ctx, "sequencer", receipt.BlockNumber.Uint64(), common.Hash{0x01, 0xaa})
+		game := disputeGameFactory.StartOutputCannonGame(ctx, "sequencer", bigs.Uint64Strict(receipt.BlockNumber), common.Hash{0x01, 0xaa})
 		require.NotNil(t, game)
 		outputRootClaim := game.DisputeLastBlock(ctx)
 		game.LogGameData(ctx)
@@ -160,7 +162,7 @@ func TestGranitePrecompiles(t *testing.T) {
 		t.Log("Capture current L2 head as agreed starting point")
 		latestBlock, err := l2Seq.BlockByNumber(ctx, nil)
 		require.NoError(t, err)
-		agreedL2Output, err := rollupClient.OutputAtBlock(ctx, latestBlock.NumberU64())
+		agreedL2Output, err := wait.ForOutputAtBlock(ctx, rollupClient, latestBlock.NumberU64())
 		require.NoError(t, err, "could not retrieve l2 agreed block")
 		l2Head := agreedL2Output.BlockRef.Hash
 		l2OutputRoot := agreedL2Output.OutputRoot
@@ -182,17 +184,21 @@ func TestGranitePrecompiles(t *testing.T) {
 		// Expect a successful receipt to retrieve the EVM call trace so we can inspect the revert reason
 		receipt, err := wait.ForReceiptMaybe(ctx, l2Seq, tx.Hash(), types.ReceiptStatusSuccessful, false)
 		require.NotNil(t, err)
-		require.Contains(t, err.Error(), "bad elliptic curve pairing input size")
+		errMsg := err.Error()
+		require.Truef(t,
+			strings.Contains(errMsg, "bad elliptic curve pairing input size") || // op-geth
+				strings.Contains(errMsg, "precompiled failed"), // op-reth
+			"expected trace error to contain known Granite precompile failure text, got %q", errMsg)
 
 		t.Logf("Transaction hash %v", tx.Hash())
 		t.Log("Determine L2 claim")
 		l2ClaimBlockNumber := receipt.BlockNumber
-		l2Output, err := rollupClient.OutputAtBlock(ctx, l2ClaimBlockNumber.Uint64())
+		l2Output, err := wait.ForOutputAtBlock(ctx, rollupClient, bigs.Uint64Strict(l2ClaimBlockNumber))
 		require.NoError(t, err, "could not get expected output")
 		l2Claim := l2Output.OutputRoot
 
 		t.Log("Determine L1 head that includes all batches required for L2 claim block")
-		require.NoError(t, wait.ForSafeBlock(ctx, rollupClient, l2ClaimBlockNumber.Uint64()))
+		require.NoError(t, wait.ForSafeBlock(ctx, rollupClient, bigs.Uint64Strict(l2ClaimBlockNumber)))
 		l1HeadBlock, err := l1Client.BlockByNumber(ctx, nil)
 		require.NoError(t, err, "get l1 head block")
 		l1Head := l1HeadBlock.Hash()
@@ -213,21 +219,21 @@ func runCannon(t *testing.T, ctx context.Context, sys *e2esys.System, inputs uti
 	l1Beacon := sys.L1BeaconEndpoint().RestHTTP()
 	rollupEndpoint := sys.RollupEndpoint("sequencer").RPC()
 	l2Endpoint := sys.NodeEndpoint("sequencer").RPC()
-	cannonOpts := challenger.WithCannon(t, sys)
+	cannonOpts := challenger.WithCannonKona(t, sys)
 	dir := t.TempDir()
 	proofsDir := filepath.Join(dir, "cannon-proofs")
 	cfg := config.NewConfig(common.Address{}, l1Endpoint, l1Beacon, rollupEndpoint, l2Endpoint, dir)
-	cfg.Cannon.L2Custom = true
+	cfg.CannonKona.L2Custom = true
 	cannonOpts(&cfg)
 
 	logger := testlog.Logger(t, log.LevelInfo).New("role", "cannon")
-	executor := vm.NewExecutor(logger, metrics.NoopMetrics.ToTypedVmMetrics("cannon"), cfg.Cannon, vm.NewOpProgramServerExecutor(logger), cfg.CannonAbsolutePreState, inputs)
+	executor := vm.NewExecutor(logger, metrics.NoopMetrics.ToTypedVmMetrics("cannon"), cfg.CannonKona, vm.NewKonaExecutor(), cfg.CannonKonaAbsolutePreState, inputs)
 
 	t.Log("Running cannon")
 	err := executor.DoGenerateProof(ctx, proofsDir, math.MaxUint, math.MaxUint, extraVmArgs...)
 	require.NoError(t, err, "failed to generate proof")
 
-	stdOut, _, err := runCmd(ctx, cfg.Cannon.VmBin, "witness", "--input", vm.FinalStatePath(proofsDir, cfg.Cannon.BinarySnapshots))
+	stdOut, _, err := runCmd(ctx, cfg.CannonKona.VmBin, "witness", "--input", vm.FinalStatePath(proofsDir, cfg.CannonKona.BinarySnapshots))
 	require.NoError(t, err, "failed to run witness cmd")
 	type stateData struct {
 		Step     uint64 `json:"step"`

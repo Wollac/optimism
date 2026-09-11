@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
-// Testing utilities
+// Testing
 import { CommonTest } from "test/setup/CommonTest.sol";
-import { stdStorage, StdStorage } from "forge-std/Test.sol";
+import { stdStorage, StdStorage } from "forge-std/StdStorage.sol";
 
 // Libraries
-import { DevFeatures } from "src/libraries/DevFeatures.sol";
+import { Features } from "src/libraries/Features.sol";
+import { Predeploys } from "src/libraries/Predeploys.sol";
 
 // Contracts
 import { LiquidityController } from "src/L2/LiquidityController.sol";
@@ -38,7 +39,7 @@ contract LiquidityController_TestInit is CommonTest {
     /// @notice Test setup.
     function setUp() public virtual override {
         super.setUp();
-        skipIfDevFeatureDisabled(DevFeatures.CUSTOM_GAS_TOKEN);
+        skipIfSysFeatureDisabled(Features.CUSTOM_GAS_TOKEN);
     }
 
     /// @notice Helper function to authorize a minter.
@@ -215,6 +216,8 @@ contract LiquidityController_Mint_Test is LiquidityController_TestInit {
 contract LiquidityController_Burn_Test is LiquidityController_TestInit {
     /// @notice Tests that the burn function can be called by an authorized minter.
     function testFuzz_burn_fromAuthorizedMinter_succeeds(uint256 _amount, address _minter) public {
+        vm.assume(_minter != Predeploys.NATIVE_ASSET_LIQUIDITY);
+
         _authorizeMinter(_minter);
         _amount = bound(_amount, 0, address(nativeAssetLiquidity).balance);
 
@@ -262,6 +265,19 @@ contract LiquidityController_Burn_Test is LiquidityController_TestInit {
 /// @title LiquidityController_Initialize_Test
 /// @notice Tests the `initialize` function of the `LiquidityController` contract.
 contract LiquidityController_Initialize_Test is LiquidityController_TestInit {
+    /// @notice Tests that initialize accepts address(0) as owner, preserving a renounced ownership
+    ///         state that L2CM may replay back into initialize() during upgrades.
+    function test_initialize_withZeroOwner_succeeds() public {
+        // Clear the initialized slot.
+        vm.store(address(liquidityController), bytes32(0), bytes32(0));
+
+        vm.prank(proxyAdminOwner);
+        vm.expectEmit(true, true, true, true);
+        emit OwnershipTransferred(proxyAdminOwner, address(0));
+        liquidityController.initialize(address(0), "Test Token", "TEST");
+        assertEq(liquidityController.owner(), address(0));
+    }
+
     /// @notice Tests that calling initialize on the implementation contract reverts.
     function testFuzz_initialize_implementation_reverts(address _owner) public {
         vm.assume(_owner != address(0));

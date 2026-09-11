@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
-import { Test } from "forge-std/Test.sol";
-import { Bytes32AddressLib } from "@rari-capital/solmate/src/utils/Bytes32AddressLib.sol";
-import { IProxy } from "interfaces/universal/IProxy.sol";
+// Testing
+import { Test } from "test/setup/Test.sol";
+
+// Scripts
 import { DeployUtils } from "scripts/libraries/DeployUtils.sol";
+
+// Libraries
+import { Bytes32AddressLib } from "@rari-capital/solmate/src/utils/Bytes32AddressLib.sol";
+
+// Interfaces
+import { IProxy } from "interfaces/universal/IProxy.sol";
 
 contract Proxy_SimpleStorage_Harness {
     mapping(uint256 => uint256) internal store;
@@ -251,7 +258,7 @@ contract Proxy_Implementation_Test is Proxy_TestInit {
         assertEq(success, false);
 
         bytes memory err = abi.encodeWithSignature("Error(string)", "Proxy: implementation not initialized"); // nosemgrep:
-            // sol-style-use-abi-encodecall
+        // sol-style-use-abi-encodecall
 
         assertEq(returndata, err);
     }

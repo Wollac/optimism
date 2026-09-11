@@ -16,18 +16,5 @@ type Network interface {
 
 	ChainConfig() *params.ChainConfig
 
-	Faucet(m FaucetMatcher) Faucet
-	Faucets() []Faucet
-	FaucetIDs() []FaucetID
-
-	SyncTester(m SyncTesterMatcher) SyncTester
 	SyncTesters() []SyncTester
-	SyncTesterIDs() []SyncTesterID
-}
-
-type ExtensibleNetwork interface {
-	Network
-
-	AddFaucet(f Faucet)
-	AddSyncTester(st SyncTester)
 }

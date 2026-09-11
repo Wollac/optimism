@@ -13,16 +13,14 @@ import (
 )
 
 func TestInteropSystemNoop(gt *testing.T) {
-	gt.Skip("Skipping Interop Acceptance Test")
-	t := devtest.SerialT(gt)
-	_ = presets.NewMinimal(t)
+	t := devtest.ParallelT(gt)
+	_ = presets.NewMinimalNoFaultProofs(t)
 	t.Log("noop")
 }
 
 func TestSmokeTest(gt *testing.T) {
-	gt.Skip("Skipping Interop Acceptance Test")
-	t := devtest.SerialT(gt)
-	sys := presets.NewMinimal(t)
+	t := devtest.ParallelT(gt)
+	sys := presets.NewMinimalNoFaultProofs(t)
 	require := t.Require()
 	ctx := t.Ctx()
 
@@ -56,9 +54,8 @@ func TestSmokeTest(gt *testing.T) {
 }
 
 func TestSmokeTestFailure(gt *testing.T) {
-	gt.Skip("Skipping Interop Acceptance Test")
-	t := devtest.SerialT(gt)
-	sys := presets.NewMinimal(t)
+	t := devtest.ParallelT(gt)
+	sys := presets.NewMinimalNoFaultProofs(t)
 	require := t.Require()
 	ctx := t.Ctx()
 

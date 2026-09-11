@@ -2,10 +2,9 @@
 pragma solidity ^0.8.0;
 
 import { Types } from "src/libraries/Types.sol";
+import { IProxyAdminOwnedBase } from "interfaces/universal/IProxyAdminOwnedBase.sol";
 
-interface IL1FeeVault {
-    error FeeVault_OnlyProxyAdminOwner();
-
+interface IL1FeeVault is IProxyAdminOwnedBase {
     error InvalidInitialization();
     error NotInitializing();
 
@@ -37,6 +36,7 @@ interface IL1FeeVault {
     function setMinWithdrawalAmount(uint256 _newMinWithdrawalAmount) external;
     function setRecipient(address _newRecipient) external;
     function setWithdrawalNetwork(Types.WithdrawalNetwork _newWithdrawalNetwork) external;
+    function setWithdrawalRoute(address _newRecipient, Types.WithdrawalNetwork _newWithdrawalNetwork) external;
 
     function version() external view returns (string memory);
 }

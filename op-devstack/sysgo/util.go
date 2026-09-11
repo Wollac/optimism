@@ -1,11 +1,14 @@
 package sysgo
 
 import (
-	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
-	"sync"
+	"time"
+
+	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
+	"github.com/stretchr/testify/assert"
 )
 
 // getEnvVarOrDefault returns the value of the provided env var or the provided default value if unset.
@@ -28,25 +31,18 @@ func propagateEnvVarOrDefault(envVarName string, defaultValue string) string {
 	}
 }
 
-// NB: arbitrary start port with a low probability of conflict
-var availableLocalPortStart = 20_000
-var availableLocalPortMutex sync.Mutex
-
-// getAvailableLocalPort searches for and returns a currently unused local port.
-// Note: this function is threadsafe.
-func getAvailableLocalPort() (string, error) {
-	availableLocalPortMutex.Lock()
-	defer availableLocalPortMutex.Unlock()
-
-	for port := availableLocalPortStart; port < 65_535; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err != nil {
-			continue
+// waitTCPReady parses a URL and waits for its TCP endpoint to become ready using EventuallyWithT.
+func waitTCPReady(p devtest.CommonT, rawURL string, timeout time.Duration) {
+	p.Helper()
+	u, err := url.Parse(rawURL)
+	p.Require().NoError(err, "parse URL: %s", rawURL)
+	p.Require().NotEmpty(u.Host, "URL has no host: %s", rawURL)
+	waitMsg := fmt.Sprintf("TCP endpoint %s not ready within %v", u.Host, timeout)
+	p.Require().EventuallyWithT(func(c *assert.CollectT) {
+		conn, err := net.DialTimeout("tcp", u.Host, 300*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
 		}
-		_ = ln.Close()
-		availableLocalPortStart = port + 1
-		return fmt.Sprintf("%d", port), nil
-	}
-
-	return "", errors.New("could not find open port")
+		assert.NoError(c, err, "TCP connection to %s should succeed", u.Host)
+	}, timeout, 100*time.Millisecond, waitMsg)
 }

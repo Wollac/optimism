@@ -10,6 +10,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/.deployer-output"
+OP_DEPLOYER_BASE_CMD=("go" "run" "./cmd/op-deployer")
 mkdir -p "$OUTPUT_DIR"
 cd "$REPO_ROOT"
 
@@ -34,6 +35,51 @@ read_env_var() {
         echo -e "${GREEN}✓ Using $env_name${NC}" >&2
     fi
     echo "$value"
+}
+
+download_op_deployer_binary() {
+    local version="$1"
+    local os
+    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) echo -e "${RED}Unsupported arch: $arch${NC}" >&2; exit 1 ;;
+    esac
+
+    local name="op-deployer-${version}-${os}-${arch}"
+    local url="https://github.com/ethereum-optimism/optimism/releases/download/op-deployer%2Fv${version}/${name}.tar.gz"
+    local dest_dir
+    dest_dir="$(mktemp -d "${TMPDIR:-/tmp}/op-deployer.XXXXXX")"
+    local tar_path="$dest_dir/${name}.tar.gz"
+    local extract_dir="$dest_dir/${name}"
+    local bin_path="$extract_dir/op-deployer"
+
+    echo -e "${BLUE}Downloading op-deployer ${version} (${os}/${arch})...${NC}"
+    if ! curl -L --fail --retry 3 "$url" -o "$tar_path"; then
+        echo -e "${RED}Download failed from:${NC} $url" >&2
+        exit 1
+    fi
+
+    if ! tar -xzf "$tar_path" -C "$dest_dir"; then
+        echo -e "${RED}Failed to extract:${NC} $tar_path" >&2
+        exit 1
+    fi
+
+    if [ ! -x "$bin_path" ]; then
+        echo -e "${RED}Binary not found after extract:${NC} $bin_path" >&2
+        exit 1
+    fi
+
+    chmod +x "$bin_path"
+    if [ "$os" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
+        xattr -d com.apple.quarantine "$bin_path" 2>/dev/null || true
+    fi
+
+    OP_DEPLOYER_BASE_CMD=("$bin_path")
+    echo -e "${GREEN}✓ Using downloaded binary:${NC} $bin_path"
 }
 
 select_verifier() {
@@ -111,7 +157,7 @@ select_verifier() {
 
 build_verify_cmd() {
     local input_file="$1"
-    local cmd=("go" "run" "./cmd/op-deployer" "verify"
+    local cmd=("${OP_DEPLOYER_BASE_CMD[@]}" "verify"
         "--l1-rpc-url" "$L1_RPC_URL"
         "--input-file" "$input_file"
         "--verifier" "$VERIFIER_TYPE"
@@ -125,7 +171,7 @@ build_verify_cmd() {
 
 build_validate_cmd() {
     local workdir="$1"
-    local cmd=("go" "run" "./cmd/op-deployer" "validate" "auto"
+    local cmd=("${OP_DEPLOYER_BASE_CMD[@]}" "validate" "auto"
         "--l1-rpc-url" "$L1_RPC_URL"
         "--workdir" "$workdir"
         "--fail"
@@ -162,6 +208,58 @@ $field = \"$value\"
     fi
 }
 
+select_runner() {
+    local prefill="${DEPLOYER_RUNNER:-}"
+    local prefill_choice=""
+    if [ "$prefill" == "docker" ]; then
+        prefill_choice="2"
+        echo -e "${GREEN}  (Pre-filled from DEPLOYER_RUNNER: docker - auto-selecting option 2)${NC}"
+    elif [ "$prefill" == "go" ]; then
+        prefill_choice="1"
+        echo -e "${GREEN}  (Pre-filled from DEPLOYER_RUNNER: go - auto-selecting option 1)${NC}"
+    elif [ "$prefill" == "binary" ]; then
+        prefill_choice="3"
+        echo -e "${GREEN}  (Pre-filled from DEPLOYER_RUNNER: binary - auto-selecting option 3)${NC}"
+    fi
+    
+    echo ""
+    echo -e "${BLUE}How would you like to run op-deployer?${NC}"
+    echo "  1) Local go run (default)"
+    echo "  2) Docker image"
+    echo "  3) Prebuilt binary (download from GitHub release)"
+    echo ""
+    
+    local choice="$prefill_choice"
+    if [ -z "$choice" ]; then
+        read -r -p "Enter choice [1-3]: " choice
+    fi
+    
+    case "$choice" in
+        2)
+            local default_tag="${DEPLOYER_IMAGE_TAG:-latest}"
+            if [ -n "${DEPLOYER_IMAGE:-}" ]; then
+                OP_DEPLOYER_IMAGE="$DEPLOYER_IMAGE"
+            else
+                read -r -p "Docker image tag [${default_tag}]: " selected_tag
+                selected_tag="${selected_tag:-$default_tag}"
+                OP_DEPLOYER_IMAGE="us-docker.pkg.dev/oplabs-tools-artifacts/images/op-deployer:${selected_tag}"
+            fi
+            OP_DEPLOYER_BASE_CMD=("docker" "run" "--rm" "-v" "$REPO_ROOT:$REPO_ROOT" "-w" "$REPO_ROOT" "$OP_DEPLOYER_IMAGE" "op-deployer")
+            echo -e "${GREEN}✓ Using docker image:${NC} $OP_DEPLOYER_IMAGE"
+            ;;
+        3)
+            local default_version="${DEPLOYER_VERSION:-0.5.1}"
+            read -r -p "Release version [${default_version}]: " selected_version
+            selected_version="${selected_version:-$default_version}"
+            download_op_deployer_binary "$selected_version"
+            ;;
+        *)
+            OP_DEPLOYER_BASE_CMD=("go" "run" "./cmd/op-deployer")
+            echo -e "${GREEN}✓ Using local go run (./cmd/op-deployer)${NC}"
+            ;;
+    esac
+}
+
 echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}   OP Deployer - Sepolia Deployment & Verification Script${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -182,6 +280,8 @@ echo ""
 
 L1_RPC_URL=$(read_env_var "L1_RPC_URL" "Enter Sepolia RPC URL: ")
 
+select_runner
+
 if [ "$DEPLOY_TYPE" != "4" ] && [ "$DEPLOY_TYPE" != "5" ]; then
     if [ -z "$DEPLOYER_PRIVATE_KEY" ]; then
         echo ""
@@ -198,11 +298,11 @@ if [ "$DEPLOY_TYPE" != "4" ] && [ "$DEPLOY_TYPE" != "5" ]; then
     fi
 fi
 
-if [ "$DEPLOY_TYPE" != "3" ] && [ "$DEPLOY_TYPE" != "5" ]; then
+if [ "$DEPLOY_TYPE" != "5" ]; then
     echo ""
     echo -e "${YELLOW}Contract Verification${NC}"
     echo "  How would you like to verify contracts?"
-    echo "    1) Auto-verify during deployment (--verify flag)"
+    echo "    1) Auto-verify during deployment (default)"
     echo "    2) Verify after deployment using state file"
     echo "    3) Skip verification"
     echo ""
@@ -233,7 +333,6 @@ case "$DEPLOY_TYPE" in
         echo ""
         
         PROXY_ADMIN_OWNER=$(read_env_var "DEPLOYER_PROXY_ADMIN_OWNER" "Superchain Proxy Admin Owner: ")
-        PROTOCOL_VERSIONS_OWNER=$(read_env_var "DEPLOYER_PROTOCOL_VERSIONS_OWNER" "Protocol Versions Owner: ")
         GUARDIAN=$(read_env_var "DEPLOYER_GUARDIAN" "Guardian Address: ")
         
         OUTPUT_FILE="$OUTPUT_DIR/sepolia-superchain-$(date +%Y%m%d-%H%M%S).json"
@@ -246,7 +345,6 @@ case "$DEPLOY_TYPE" in
         echo "  These should be from a previous superchain deployment"
         echo ""
         
-        PROTOCOL_VERSIONS_PROXY=$(read_env_var "DEPLOYER_PROTOCOL_VERSIONS_PROXY" "Protocol Versions Proxy Address: ")
         SUPERCHAIN_CONFIG_PROXY=$(read_env_var "DEPLOYER_SUPERCHAIN_CONFIG_PROXY" "Superchain Config Proxy Address: ")
         SUPERCHAIN_PROXY_ADMIN=$(read_env_var "DEPLOYER_SUPERCHAIN_PROXY_ADMIN" "Superchain Proxy Admin Address: ")
         L1_PROXY_ADMIN_OWNER=$(read_env_var "DEPLOYER_L1_PROXY_ADMIN_OWNER" "L1 Proxy Admin Owner Address: ")
@@ -353,7 +451,7 @@ case "$DEPLOY_TYPE" in
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
             echo ""
             
-            INIT_CMD=("go" "run" "./cmd/op-deployer" "init"
+            INIT_CMD=("${OP_DEPLOYER_BASE_CMD[@]}" "init"
                 "--l1-chain-id" "$L1_CHAIN_ID"
                 "--l2-chain-ids" "$L2_CHAIN_ID"
                 "--workdir" "$WORKDIR"
@@ -390,12 +488,6 @@ case "$DEPLOY_TYPE" in
                     "operatorFeeVaultRecipient:OperatorFeeVaultRecipient"
                 )
                 
-                if grep -q 'useRevenueShare = true' "$WORKDIR/intent.toml" 2>/dev/null; then
-                    if grep -q 'chainFeesRecipient = "0x0000000000000000000000000000000000000000"' "$WORKDIR/intent.toml" 2>/dev/null || ! grep -q 'chainFeesRecipient' "$WORKDIR/intent.toml" 2>/dev/null; then
-                        REQUIRED_FIELDS+=("chainFeesRecipient:ChainFeesRecipient")
-                    fi
-                fi
-                
                 NEEDS_FIX=false
                 for field_info in "${REQUIRED_FIELDS[@]}"; do
                     field_name="${field_info%%:*}"
@@ -424,8 +516,6 @@ case "$DEPLOY_TYPE" in
                         FIELD_NEEDS_FIX=false
                         if grep -q "$field_name = \"0x0000000000000000000000000000000000000000\"" "$WORKDIR/intent.toml" 2>/dev/null; then
                             FIELD_NEEDS_FIX=true
-                        elif [ "$field_name" == "chainFeesRecipient" ] && ! grep -q "$field_name" "$WORKDIR/intent.toml" 2>/dev/null; then
-                            FIELD_NEEDS_FIX=true
                         fi
                         
                         if [ "$FIELD_NEEDS_FIX" == "true" ]; then
@@ -448,32 +538,33 @@ case "$DEPLOY_TYPE" in
                                     rm -f "${WORKDIR}/intent.toml.bak" 2>/dev/null
                                     echo -e "${GREEN}✓ Set $field_display to: $ADDRESS_TO_USE${NC}"
                                 else
-                                    if grep -q 'useRevenueShare = true' "$WORKDIR/intent.toml" 2>/dev/null; then
-                                        if ! sed -i.bak "/useRevenueShare = true/a\\
-  $field_name = \"$ADDRESS_TO_USE\"
-" "$WORKDIR/intent.toml" 2>/dev/null; then
-                                            if sed "/useRevenueShare = true/a\\
-  $field_name = \"$ADDRESS_TO_USE\"
-" "$WORKDIR/intent.toml" > "${WORKDIR}/intent.toml.tmp" 2>/dev/null && [ -f "${WORKDIR}/intent.toml.tmp" ]; then
-                                                mv "${WORKDIR}/intent.toml.tmp" "$WORKDIR/intent.toml"
-                                            fi
-                                        fi
-                                        rm -f "${WORKDIR}/intent.toml.bak" 2>/dev/null
-                                        echo -e "${GREEN}✓ Added $field_display: $ADDRESS_TO_USE${NC}"
-                                    else
-                                        if ! sed -i.bak "/\[\[chains\]\]/,/^\[\[/ { /operatorFeeVaultRecipient = /a\\
+                                    if ! sed -i.bak "/\[\[chains\]\]/,/^\[\[/ { /operatorFeeVaultRecipient = /a\\
   $field_name = \"$ADDRESS_TO_USE\"
 }" "$WORKDIR/intent.toml" 2>/dev/null; then
-                                            echo -e "${YELLOW}⚠️  Could not automatically add $field_display. Please add it manually to intent.toml${NC}"
-                                        fi
-                                        rm -f "${WORKDIR}/intent.toml.bak" 2>/dev/null
+                                        echo -e "${YELLOW}⚠️  Could not automatically add $field_display. Please add it manually to intent.toml${NC}"
                                     fi
+                                    rm -f "${WORKDIR}/intent.toml.bak" 2>/dev/null
                                 fi
                             fi
                         fi
                     done
                 fi
             fi
+        fi
+        
+        USE_FORGE=false
+        if [ -n "${DEPLOYER_USE_FORGE:-}" ]; then
+            USE_FORGE=true
+            echo ""
+            echo -e "${GREEN}✓ Using Forge from environment${NC}"
+        else
+            echo ""
+            echo -e "${YELLOW}Deployment Engine${NC}"
+            echo "  1) Use default Go scripts (recommended)"
+            echo "  2) Use Forge scripts"
+            echo ""
+            read -r -p "Select deployment engine [1-2, default 1]: " ENGINE_CHOICE
+            [ "$ENGINE_CHOICE" == "2" ] && USE_FORGE=true
         fi
         
         AUTO_VALIDATE_ENABLED=false
@@ -499,6 +590,11 @@ case "$DEPLOY_TYPE" in
         echo "  Workdir: $WORKDIR"
         echo "  L1 Chain ID: $L1_CHAIN_ID"
         echo "  L2 Chain ID: $L2_CHAIN_ID"
+        if [ "$USE_FORGE" == "true" ]; then
+            echo -e "  Engine: ${GREEN}Forge scripts${NC}"
+        else
+            echo -e "  Engine: ${GREEN}Go scripts (default)${NC}"
+        fi
         if [ "$AUTO_VALIDATE_ENABLED" == "true" ]; then
             echo -e "  Validation: ${GREEN}Enabled (auto-detect version and chain ID)${NC}"
         else
@@ -524,14 +620,22 @@ case "$DEPLOY_TYPE" in
         echo "  - Or there's an issue with the OPCM contract configuration"
         echo ""
         
-        APPLY_CMD=("go" "run" "./cmd/op-deployer" "apply"
+        APPLY_CMD=("${OP_DEPLOYER_BASE_CMD[@]}" "apply"
             "--l1-rpc-url" "$L1_RPC_URL"
             "--workdir" "$WORKDIR"
             "--private-key" "$PRIVATE_KEY"
             "--deployment-target" "live"
         )
         
+        [ "$USE_FORGE" == "true" ] && APPLY_CMD+=("--use-forge")
         [ "$AUTO_VALIDATE_ENABLED" == "true" ] && APPLY_CMD+=("--validate" "auto")
+
+        if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
+            APPLY_CMD+=("--verifier" "$VERIFIER_TYPE")
+            [[ "$VERIFIER_TYPE" == *"etherscan"* ]] && [ -n "$ETHERSCAN_API_KEY" ] && APPLY_CMD+=("--verifier-api-key" "$ETHERSCAN_API_KEY")
+        else
+            APPLY_CMD+=("--no-verify")
+        fi
         
         if "${APPLY_CMD[@]}"; then
             echo ""
@@ -541,6 +645,15 @@ case "$DEPLOY_TYPE" in
             echo ""
             echo "  State file: $WORKDIR/state.json"
             echo "  Intent file: $WORKDIR/intent.toml"
+
+            if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
+                echo -e "${YELLOW}Verification attempted during deployment; check the summary above for failures.${NC}"
+            elif [ "$POST_DEPLOY_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
+                read -ra VERIFY_CMD <<< "$(build_verify_cmd "$WORKDIR/state.json")"
+                "${VERIFY_CMD[@]}" || echo -e "${YELLOW}Verification had some issues; check the output above.${NC}"
+            else
+                echo -e "${YELLOW}Verification was skipped.${NC}"
+            fi
         else
             echo ""
             echo -e "${RED}✗ Apply failed!${NC}"
@@ -696,7 +809,7 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    CMD=("go" "run" "./cmd/op-deployer")
+    CMD=("${OP_DEPLOYER_BASE_CMD[@]}")
     
     if [ "$DEPLOY_TYPE" == "1" ]; then
         CMD+=(
@@ -705,7 +818,6 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
             "--private-key" "$PRIVATE_KEY"
             "--outfile" "$OUTPUT_FILE"
             "--superchain-proxy-admin-owner" "$PROXY_ADMIN_OWNER"
-            "--protocol-versions-owner" "$PROTOCOL_VERSIONS_OWNER"
             "--guardian" "$GUARDIAN"
         )
     else
@@ -714,7 +826,6 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
             "--l1-rpc-url" "$L1_RPC_URL"
             "--private-key" "$PRIVATE_KEY"
             "--outfile" "$OUTPUT_FILE"
-            "--protocol-versions-proxy" "$PROTOCOL_VERSIONS_PROXY"
             "--superchain-config-proxy" "$SUPERCHAIN_CONFIG_PROXY"
             "--superchain-proxy-admin" "$SUPERCHAIN_PROXY_ADMIN"
             "--l1-proxy-admin-owner" "$L1_PROXY_ADMIN_OWNER"
@@ -723,10 +834,16 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
         )
     fi
     
-    if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
-        CMD+=("--verify" "--verifier" "$VERIFIER_TYPE")
-        [[ "$VERIFIER_TYPE" == *"etherscan"* ]] && [ -n "$ETHERSCAN_API_KEY" ] && CMD+=("--verifier-api-key" "$ETHERSCAN_API_KEY")
-    fi
+	if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
+	    CMD+=("--verifier" "$VERIFIER_TYPE")
+	    [[ "$VERIFIER_TYPE" == *"etherscan"* ]] && [ -n "$ETHERSCAN_API_KEY" ] && CMD+=("--verifier-api-key" "$ETHERSCAN_API_KEY")
+	else
+	    CMD+=("--no-verify")
+	fi
+    
+
+    
+    [ "$USE_FORGE" == "true" ] && CMD+=("--use-forge")
     
     if "${CMD[@]}"; then
         echo ""
@@ -743,8 +860,8 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
             echo ""
         fi
         
-        if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
-            echo -e "${GREEN}✓ Contracts verified during deployment${NC}"
+	    if [ "$AUTO_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
+	        echo -e "${YELLOW}Verification attempted during deployment; check the summary above for failures.${NC}"
             [[ "$VERIFIER_TYPE" == *"etherscan"* ]] && echo "  Etherscan: https://sepolia.etherscan.io/"
             [[ "$VERIFIER_TYPE" == *"blockscout"* ]] && echo "  Blockscout: https://eth-sepolia.blockscout.com/"
         elif [ "$POST_DEPLOY_VERIFY" == "true" ] && [ -n "$VERIFIER_TYPE" ]; then
@@ -821,16 +938,14 @@ if [ "$DEPLOY_TYPE" == "1" ] || [ "$DEPLOY_TYPE" == "2" ]; then
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
             echo ""
             
-            PROTOCOL_VERSIONS_PROXY=$(jq -r '.protocolVersionsProxyAddress // .ProtocolVersionsProxyAddress' "$OUTPUT_FILE" 2>/dev/null)
             SUPERCHAIN_CONFIG_PROXY=$(jq -r '.superchainConfigProxyAddress // .SuperchainConfigProxyAddress' "$OUTPUT_FILE" 2>/dev/null)
             SUPERCHAIN_PROXY_ADMIN=$(jq -r '.proxyAdminAddress // .ProxyAdminAddress' "$OUTPUT_FILE" 2>/dev/null)
-            
+
             echo "# Environment variables for next deployment"
             echo "export L1_RPC_URL=\"$L1_RPC_URL\""
             echo "export DEPLOYER_PRIVATE_KEY=\"$PRIVATE_KEY\""
             [ -n "$VERIFIER_TYPE" ] && echo "export DEPLOYER_VERIFIER_TYPE=\"$VERIFIER_TYPE\""
             [ -n "$ETHERSCAN_API_KEY" ] && echo "export DEPLOYER_VERIFIER_API_KEY=\"$ETHERSCAN_API_KEY\""
-            echo "export DEPLOYER_PROTOCOL_VERSIONS_PROXY=\"$PROTOCOL_VERSIONS_PROXY\""
             echo "export DEPLOYER_SUPERCHAIN_CONFIG_PROXY=\"$SUPERCHAIN_CONFIG_PROXY\""
             echo "export DEPLOYER_SUPERCHAIN_PROXY_ADMIN=\"$SUPERCHAIN_PROXY_ADMIN\""
             echo "export DEPLOYER_L1_PROXY_ADMIN_OWNER=\"$PROXY_ADMIN_OWNER\""

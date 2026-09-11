@@ -2,13 +2,16 @@ package proofs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"time"
 
 	challengerTypes "github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
+	gameTypes "github.com/ethereum-optimism/optimism/op-challenger/game/types"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -18,8 +21,16 @@ import (
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	opservice "github.com/ethereum-optimism/optimism/op-service"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/txplan"
 )
+
+// txTimeout is the maximum time to wait for a single transaction to be
+// estimated, submitted, and included. Without this, transactions inherit the
+// test's full context deadline (~2 hours in CI) and a hanging RPC call
+// (e.g. eth_estimateGas for an EIP-7702 delegated EOA) blocks silently
+// for the entire duration.
+const txTimeout = 5 * time.Minute
 
 type GameHelperMove struct {
 	ParentIdx *big.Int
@@ -58,7 +69,9 @@ func DeployGameHelper(t devtest.T, deployer *dsl.EOA, honestTraceProvider func(g
 	)
 
 	deployTx := txplan.NewPlannedTx(deployTxOpts)
-	receipt, err := deployTx.Included.Eval(t.Ctx())
+	deployCtx, deployCancel := context.WithTimeout(t.Ctx(), txTimeout)
+	defer deployCancel()
+	receipt, err := deployTx.Included.Eval(deployCtx)
 	req.NoError(err, "Failed to deploy GameHelper contract")
 
 	req.Equal(types.ReceiptStatusSuccessful, receipt.Status, "GameHelper deployment failed")
@@ -123,7 +136,9 @@ func getGameHelperArtifactPath(t devtest.T) string {
 
 func (gs *GameHelper) AuthEOA(eoa *dsl.EOA) *GameHelper {
 	tx := txplan.NewPlannedTx(eoa.PlanAuth(gs.contractAddr))
-	receipt, err := tx.Included.Eval(gs.t.Ctx())
+	authCtx, authCancel := context.WithTimeout(gs.t.Ctx(), txTimeout)
+	defer authCancel()
+	receipt, err := tx.Included.Eval(authCtx)
 	gs.require.NoError(err)
 	gs.require.Equal(types.ReceiptStatusSuccessful, receipt.Status)
 	return &GameHelper{
@@ -138,7 +153,7 @@ func (gs *GameHelper) AuthEOA(eoa *dsl.EOA) *GameHelper {
 func (gs *GameHelper) CreateGameWithClaims(
 	eoa *dsl.EOA,
 	factory *DisputeGameFactory,
-	gameType challengerTypes.GameType,
+	gameType gameTypes.GameType,
 	rootClaim common.Hash,
 	extraData []byte,
 	moves []GameHelperMove,
@@ -158,7 +173,9 @@ func (gs *GameHelper) CreateGameWithClaims(
 			txplan.WithData(data),
 		),
 	)
-	receipt, err := tx.Included.Eval(gs.t.Ctx())
+	createCtx, createCancel := context.WithTimeout(gs.t.Ctx(), txTimeout)
+	defer createCancel()
+	receipt, err := tx.Included.Eval(createCtx)
 	gs.require.NoError(err)
 	gs.require.Equal(types.ReceiptStatusSuccessful, receipt.Status)
 
@@ -170,7 +187,7 @@ func (gs *GameHelper) DisputeL2SequenceNumber(eoa *dsl.EOA, game *FaultDisputeGa
 	startingSeqNumber := game.StartingL2SequenceNumber()
 	gs.require.Greater(l2SequenceNumber, startingSeqNumber, "Cannot dispute things at or prior to the starting block")
 	seqNumAtPosition := func(pos challengerTypes.Position) uint64 {
-		return pos.TraceIndex(splitDepth).Uint64() + startingSeqNumber + 1
+		return bigs.Uint64Strict(pos.TraceIndex(splitDepth)) + startingSeqNumber + 1
 	}
 	shouldMoveLeftFrom := func(pos challengerTypes.Position) bool {
 		// Move left when equal to the sequence number so that we disagree with it
@@ -213,7 +230,7 @@ func (gs *GameHelper) DisputeToStep(eoa *dsl.EOA, game *FaultDisputeGame, startC
 	traceIndexAtPosition := func(pos challengerTypes.Position) uint64 {
 		relativeFinalPosition, err := pos.RelativeToAncestorAtDepth(splitDepth + 1)
 		gs.require.NoError(err, "Failed to calculate relative position")
-		return relativeFinalPosition.TraceIndex(maxDepth - splitDepth - 1).Uint64()
+		return bigs.Uint64Strict(relativeFinalPosition.TraceIndex(maxDepth - splitDepth - 1))
 	}
 	shouldMoveLeftFrom := func(pos challengerTypes.Position) bool {
 		// Move left when equal to the trace index so that we disagree with it
@@ -305,7 +322,9 @@ func (gs *GameHelper) PerformMoves(eoa *dsl.EOA, game *FaultDisputeGame, moves [
 		),
 	)
 	preClaimCount := game.claimCount()
-	receipt, err := tx.Included.Eval(gs.t.Ctx())
+	moveCtx, moveCancel := context.WithTimeout(gs.t.Ctx(), txTimeout)
+	defer moveCancel()
+	receipt, err := tx.Included.Eval(moveCtx)
 	gs.require.NoError(err)
 	gs.require.Equal(types.ReceiptStatusSuccessful, receipt.Status)
 	postClaimCount := game.claimCount()
@@ -346,14 +365,14 @@ func (gs *GameHelper) totalMoveBonds(game *FaultDisputeGame, moves []GameHelperM
 	preExistingClaimCount := game.claimCount()
 	totalBond := eth.Ether(0)
 	for i, move := range moves {
-		parentPos := claimPositions[move.ParentIdx.Uint64()]
+		parentPos := claimPositions[bigs.Uint64Strict(move.ParentIdx)]
 		if parentPos == (challengerTypes.Position{}) {
-			gs.require.LessOrEqual(move.ParentIdx.Uint64(), preExistingClaimCount, "No parent position found - moves may be out of order")
+			gs.require.LessOrEqual(bigs.Uint64Strict(move.ParentIdx), preExistingClaimCount, "No parent position found - moves may be out of order")
 			// Handle cases were there are existing claims and we're adding moves that reference them
 			gs.t.Logf("Loading parent position for existing claim at index %v", move.ParentIdx)
-			parentClaim := game.ClaimAtIndex(move.ParentIdx.Uint64())
+			parentClaim := game.ClaimAtIndex(bigs.Uint64Strict(move.ParentIdx))
 			parentPos = parentClaim.Position()
-			claimPositions[move.ParentIdx.Uint64()] = parentPos
+			claimPositions[bigs.Uint64Strict(move.ParentIdx)] = parentPos
 		}
 		childPos := parentPos.Defend()
 		if move.Attack {

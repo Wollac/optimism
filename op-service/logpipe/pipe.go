@@ -1,10 +1,10 @@
 package logpipe
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	oplog "github.com/ethereum-optimism/optimism/op-service/log"
 	"github.com/ethereum/go-ethereum/log"
@@ -14,13 +14,14 @@ type rawRustJSONLog struct {
 	//"timestamp" ignored
 	Level  string         `json:"level"`
 	Fields map[string]any `json:"fields"`
-	//"target" ignored"
+	Target string         `json:"target"`
 }
 
 type StructuredRustLogEntry struct {
 	Message string
 	Level   slog.Level
 	Fields  map[string]any
+	Target  string
 }
 
 func ParseRustStructuredLogs(line []byte) LogEntry {
@@ -45,6 +46,7 @@ func ParseRustStructuredLogs(line []byte) LogEntry {
 		Message: msg,
 		Level:   lvl,
 		Fields:  e.Fields,
+		Target:  e.Target,
 	}
 }
 
@@ -57,7 +59,10 @@ func (e StructuredRustLogEntry) LogMessage() string {
 }
 
 func (e StructuredRustLogEntry) LogFields() []any {
-	attrs := make([]any, 0, len(e.Fields))
+	attrs := make([]any, 0, len(e.Fields)+1)
+	if e.Target != "" {
+		attrs = append(attrs, slog.String("target", e.Target))
+	}
 	for k, v := range e.Fields {
 		if x, ok := v.(json.Number); ok {
 			v = x.String()
@@ -78,29 +83,20 @@ type LogEntry interface {
 	FieldValue(key string) any
 }
 
-type LogProcessor func(line []byte)
-
-func (lo LogProcessor) Write(data []byte) (int, error) {
-	startingLength := len(data)
-	buf := bytes.NewBuffer(data)
-	scanner := bufio.NewScanner(buf)
-	for scanner.Scan() {
-		lineBytes := scanner.Bytes()
-		if len(lineBytes) == 0 {
-			continue // Skip empty lines
-		}
-		lo(lineBytes)
-	}
-	return startingLength - buf.Len(), scanner.Err()
-}
-
 type LogParser func(line []byte) LogEntry
 
 func ToLogger(logger log.Logger) func(e LogEntry) {
+	return ToLoggerWithMinLevel(logger, log.LevelTrace)
+}
+
+func ToLoggerWithMinLevel(logger log.Logger, minLevel slog.Level) func(e LogEntry) {
 	return func(e LogEntry) {
 		msg := e.LogMessage()
 		attrs := e.LogFields()
 		lvl := e.LogLevel()
+		if lvl < minLevel {
+			return
+		}
 
 		if lvl >= log.LevelCrit {
 			// If a sub-process has a critical error, this process can handle it
@@ -109,5 +105,21 @@ func ToLogger(logger log.Logger) func(e LogEntry) {
 			attrs = append(attrs, slog.String("innerLevel", "CRIT"))
 		}
 		logger.Log(lvl, msg, attrs...)
+	}
+}
+
+// ToLoggerRaisedToLevel emits every entry at minLevel or above: entries below
+// minLevel are raised to minLevel, carrying the original level in an
+// "innerLevel" attribute, so they survive downstream min-level log filters.
+func ToLoggerRaisedToLevel(logger log.Logger, minLevel slog.Level) func(e LogEntry) {
+	emit := ToLoggerWithMinLevel(logger, minLevel)
+	return func(e LogEntry) {
+		lvl := e.LogLevel()
+		if lvl >= minLevel {
+			emit(e)
+			return
+		}
+		attrs := append(e.LogFields(), slog.String("innerLevel", strings.ToUpper(log.LevelString(lvl))))
+		logger.Log(minLevel, e.LogMessage(), attrs...)
 	}
 }

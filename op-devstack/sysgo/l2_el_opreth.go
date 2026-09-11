@@ -1,31 +1,110 @@
 package sysgo
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
-	"github.com/ethereum-optimism/optimism/op-devstack/shim"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
-	"github.com/ethereum-optimism/optimism/op-service/client"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/logpipe"
 	"github.com/ethereum-optimism/optimism/op-service/tasks"
 	"github.com/ethereum-optimism/optimism/op-service/testutils/tcpproxy"
-	gn "github.com/ethereum/go-ethereum/node"
-	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/log"
 )
+
+// OpRethConfig holds the configurable knobs applied to an op-reth node before it is started.
+type OpRethConfig struct {
+	// ExtraArgs are appended to the generated CLI args.
+	ExtraArgs []string
+	// Binary selects the EL binary to launch. Empty means "op-reth". A CLI-compatible superset
+	// (any binary that accepts every op-reth subcommand/flag, plus optionally its own additive
+	// flags) may be selected via OpRethWithBinary.
+	Binary string
+	// DisableProofsHistory skips the proofs-history init + runtime flags for this node. The mixed
+	// runtime otherwise enables proofs-history on every op-reth node; some CLI-superset binaries
+	// reject --proofs-history in the mode under test.
+	DisableProofsHistory bool
+}
+
+// DefaultOpRethConfig returns a zero-valued OpRethConfig that callers can mutate via OpRethOptions.
+func DefaultOpRethConfig() *OpRethConfig {
+	return &OpRethConfig{}
+}
+
+// OpRethOption customises an OpRethConfig for a specific component target.
+type OpRethOption interface {
+	Apply(p devtest.T, target ComponentTarget, cfg *OpRethConfig)
+}
+
+// OpRethOptionFn adapts a plain function into an OpRethOption.
+type OpRethOptionFn func(p devtest.T, target ComponentTarget, cfg *OpRethConfig)
+
+var _ OpRethOption = OpRethOptionFn(nil)
+
+// Apply invokes the underlying function against the supplied config.
+func (fn OpRethOptionFn) Apply(p devtest.T, target ComponentTarget, cfg *OpRethConfig) {
+	fn(p, target, cfg)
+}
+
+// OpRethOptionBundle applies multiple OpRethOptions in order.
+type OpRethOptionBundle []OpRethOption
+
+var _ OpRethOption = OpRethOptionBundle(nil)
+
+// Apply runs each contained option against cfg, failing the test on a nil entry.
+func (b OpRethOptionBundle) Apply(p devtest.T, target ComponentTarget, cfg *OpRethConfig) {
+	for _, opt := range b {
+		p.Require().NotNil(opt, "cannot Apply nil OpRethOption")
+		opt.Apply(p, target, cfg)
+	}
+}
+
+// OpRethWithExtraArgs appends raw CLI arguments to the op-reth invocation.
+func OpRethWithExtraArgs(args ...string) OpRethOption {
+	return OpRethOptionFn(func(p devtest.T, _ ComponentTarget, cfg *OpRethConfig) {
+		cfg.ExtraArgs = append(cfg.ExtraArgs, args...)
+	})
+}
+
+// OpRethWithBinary selects the EL binary to launch instead of the default "op-reth". The binary
+// must be a CLI superset of op-reth (it is invoked with op-reth's subcommands and flags). A binary
+// that lives outside this repo is resolved via the rustbin env overrides keyed off its name —
+// RUST_BINARY_PATH_<NAME> (or RUST_SRC_DIR_<NAME> + RUST_JIT_BUILD), with <NAME> the upper-snake-cased
+// binary name.
+func OpRethWithBinary(binary string) OpRethOption {
+	return OpRethOptionFn(func(p devtest.T, _ ComponentTarget, cfg *OpRethConfig) {
+		cfg.Binary = binary
+	})
+}
+
+// OpRethWithoutProofsHistory disables the proofs-history subsystem for this node. The mixed runtime
+// enables proofs-history on every op-reth node by default; use this for a CLI-superset binary that
+// rejects --proofs-history in the mode under test.
+func OpRethWithoutProofsHistory() OpRethOption {
+	return OpRethOptionFn(func(p devtest.T, _ ComponentTarget, cfg *OpRethConfig) {
+		cfg.DisableProofsHistory = true
+	})
+}
+
+// OpRethWithInteropURL wires the op-reth node to the given interop filter HTTP endpoint.
+// An empty interopURL is a no-op so callers can pass the value unconditionally.
+func OpRethWithInteropURL(interopURL string) OpRethOption {
+	return OpRethOptionFn(func(p devtest.T, _ ComponentTarget, cfg *OpRethConfig) {
+		if interopURL == "" {
+			return
+		}
+		cfg.ExtraArgs = append(cfg.ExtraArgs, "--rollup.interop-http="+interopURL)
+	})
+}
 
 type OpReth struct {
 	mu sync.Mutex
 
-	id        stack.L2ELNodeID
-	l2Net     *L2Network
+	name      string
+	chainID   eth.ChainID
 	jwtPath   string
 	jwtSecret [32]byte
 	authRPC   string
@@ -39,7 +118,7 @@ type OpReth struct {
 	// Each entry is of the form "key=value".
 	env []string
 
-	p devtest.P
+	p devtest.T
 
 	sub *SubProcess
 
@@ -47,35 +126,6 @@ type OpReth struct {
 }
 
 var _ L2ELNode = (*OpReth)(nil)
-
-func (n *OpReth) hydrate(system stack.ExtensibleSystem) {
-	require := system.T().Require()
-	rpcCl, err := client.NewRPC(system.T().Ctx(), system.Logger(), n.userRPC, client.WithLazyDial())
-	require.NoError(err)
-	system.T().Cleanup(rpcCl.Close)
-
-	// Do not have to check whether client is readOnly because
-	// all external L2 Clients will be wrapped with op-geth sysgo devstack, supporting readOnly
-	var engineCl client.RPC
-	auth := rpc.WithHTTPAuth(gn.NewJWTAuth(n.jwtSecret))
-	engineCl, err = client.NewRPC(system.T().Ctx(), system.Logger(), n.authRPC, client.WithGethRPCOptions(auth))
-	require.NoError(err)
-	system.T().Cleanup(engineCl.Close)
-
-	l2Net := system.L2Network(stack.L2NetworkID(n.id.ChainID()))
-	sysL2EL := shim.NewL2ELNode(shim.L2ELNodeConfig{
-		RollupCfg: l2Net.RollupConfig(),
-		ELNodeConfig: shim.ELNodeConfig{
-			CommonConfig: shim.NewCommonConfig(system.T()),
-			Client:       rpcCl,
-			ChainID:      n.id.ChainID(),
-		},
-		EngineClient: engineCl,
-		ID:           n.id,
-	})
-	sysL2EL.SetLabel(match.LabelVendor, string(match.OpReth))
-	l2Net.(stack.ExtensibleL2Network).AddL2ELNode(sysL2EL)
-}
 
 func (n *OpReth) Start() {
 	n.mu.Lock()
@@ -100,8 +150,21 @@ func (n *OpReth) Start() {
 		})
 		n.userRPC = "ws://" + n.userProxy.Addr()
 	}
-	logOut := logpipe.ToLogger(n.p.Logger().New("component", "op-reth", "src", "stdout"))
-	logErr := logpipe.ToLogger(n.p.Logger().New("component", "op-reth", "src", "stderr"))
+	stdoutLogger := n.p.Logger().New("component", "op-reth", "src", "stdout", "name", n.name, "chain", n.chainID)
+	stdoutInfo := logpipe.ToLoggerWithMinLevel(stdoutLogger, log.LevelInfo)
+	// Peer-disconnect reasons are logged below INFO under net::session / net::peers.
+	// Raise those entries to INFO (original level kept as an attribute) so they
+	// survive the devtest INFO log filter and peer drops stay diagnosable.
+	stdoutNetPeers := logpipe.ToLoggerRaisedToLevel(stdoutLogger, log.LevelInfo)
+	logOut := func(e logpipe.LogEntry) {
+		if r, ok := e.(logpipe.StructuredRustLogEntry); ok &&
+			(strings.HasPrefix(r.Target, "net::session") || strings.HasPrefix(r.Target, "net::peers")) {
+			stdoutNetPeers(e)
+			return
+		}
+		stdoutInfo(e)
+	}
+	logErr := logpipe.ToLoggerWithMinLevel(n.p.Logger().New("component", "op-reth", "src", "stderr", "name", n.name, "chain", n.chainID), log.LevelWarn)
 
 	authRPCChan := make(chan string, 1)
 	defer close(authRPCChan)
@@ -134,12 +197,12 @@ func (n *OpReth) Start() {
 			metricsTargetChan <- NewPrometheusMetricsTarget(parsedUrl.Hostname(), parsedUrl.Port(), false)
 		}
 	}
-	stdOutLogs := logpipe.LogProcessor(func(line []byte) {
+	stdOutLogs := logpipe.LogCallback(func(line []byte) {
 		e := logpipe.ParseRustStructuredLogs(line)
 		logOut(e)
 		onLogEntry(e)
 	})
-	stdErrLogs := logpipe.LogProcessor(func(line []byte) {
+	stdErrLogs := logpipe.LogCallback(func(line []byte) {
 		e := logpipe.ParseRustStructuredLogs(line)
 		logErr(e)
 	})
@@ -155,7 +218,7 @@ func (n *OpReth) Start() {
 	if areMetricsEnabled() {
 		var metricsTarget PrometheusMetricsTarget
 		n.p.Require().NoError(tasks.Await(n.p.Ctx(), metricsTargetChan, &metricsTarget), "need metrics endpoint")
-		n.l2MetricsRegistrar.RegisterL2MetricsTargets(n.id, metricsTarget)
+		n.l2MetricsRegistrar.RegisterL2MetricsTargets(n.name, metricsTarget)
 	}
 
 	n.userProxy.SetUpstream(ProxyAddr(n.p.Require(), userRPCAddr))
@@ -163,13 +226,51 @@ func (n *OpReth) Start() {
 }
 
 // Stop stops the op-reth node.
-// warning: no restarts supported yet, since the RPC port is not remembered.
 func (n *OpReth) Stop() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.sub == nil {
+		n.p.Logger().Warn("op-reth already stopped")
+		return
+	}
+	n.clearProxyUpstreams()
 	err := n.sub.Stop(true)
 	n.p.Require().NoError(err, "Must stop")
 	n.sub = nil
+}
+
+// Callers must hold n.mu.
+func (n *OpReth) clearProxyUpstreams() {
+	if n.userProxy != nil {
+		n.userProxy.ClearUpstream()
+	}
+	if n.authProxy != nil {
+		n.authProxy.ClearUpstream()
+	}
+}
+
+func (n *OpReth) StartControlled(ctx context.Context) error {
+	return runControlStart(ctx, n.Running, n.Start)
+}
+
+func (n *OpReth) StopControlled(ctx context.Context) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.sub == nil {
+		return nil
+	}
+	n.clearProxyUpstreams()
+	if err := n.sub.StopControlled(ctx, controlledInterruptWait, controlledKillWait); err != nil {
+		return err
+	}
+	n.sub = nil
+	return nil
+}
+
+func (n *OpReth) Running() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sub != nil
 }
 
 func (n *OpReth) UserRPC() string {
@@ -182,120 +283,4 @@ func (n *OpReth) EngineRPC() string {
 
 func (n *OpReth) JWTPath() string {
 	return n.jwtPath
-}
-
-func WithOpReth(id stack.L2ELNodeID, opts ...L2ELOption) stack.Option[*Orchestrator] {
-	return stack.AfterDeploy(func(orch *Orchestrator) {
-		p := orch.P().WithCtx(stack.ContextWithID(orch.P().Ctx(), id))
-		require := p.Require()
-
-		l2Net, ok := orch.l2Nets.Get(id.ChainID())
-		require.True(ok, "L2 network required")
-
-		cfg := DefaultL2ELConfig()
-		orch.l2ELOptions.Apply(p, id, cfg)       // apply global options
-		L2ELOptionBundle(opts).Apply(p, id, cfg) // apply specific options
-
-		jwtPath, jwtSecret := orch.writeDefaultJWT()
-
-		useInterop := l2Net.genesis.Config.InteropTime != nil
-
-		supervisorRPC := ""
-		if useInterop {
-			require.NotNil(cfg.SupervisorID, "supervisor is required for interop")
-			sup, ok := orch.supervisors.Get(*cfg.SupervisorID)
-			require.True(ok, "supervisor is required for interop")
-			supervisorRPC = sup.UserRPC()
-		}
-
-		tempDir := p.TempDir()
-		data, err := json.Marshal(l2Net.genesis)
-		p.Require().NoError(err, "must json-encode genesis")
-		chainConfigPath := filepath.Join(tempDir, "genesis.json")
-		p.Require().NoError(os.WriteFile(chainConfigPath, data, 0o644), "must write genesis file")
-
-		dataDirPath := filepath.Join(tempDir, "data")
-		p.Require().NoError(os.MkdirAll(dataDirPath, 0o755), "must create datadir")
-
-		// reth writes logs not just to stdout, but also to file,
-		// and to global user-cache by default, rather than the datadir.
-		// So we customize this to temp-dir too, to not pollute the user-cache dir.
-		logDirPath := filepath.Join(tempDir, "logs")
-		p.Require().NoError(os.MkdirAll(dataDirPath, 0o755), "must create logs dir")
-
-		tempP2PPath := filepath.Join(tempDir, "p2pkey.txt")
-
-		execPath := os.Getenv("OP_RETH_EXEC_PATH")
-		p.Require().NotEmpty(execPath, "OP_RETH_EXEC_PATH environment variable must be set")
-		_, err = os.Stat(execPath)
-		p.Require().NotErrorIs(err, os.ErrNotExist, "executable must exist")
-
-		// reth does not support env-var configuration like the Go services,
-		// so we use the CLI flags instead.
-		args := []string{
-			"node",
-			"--addr=127.0.0.1",
-			"--authrpc.addr=127.0.0.1",
-			"--authrpc.jwtsecret=" + jwtPath,
-			"--authrpc.port=0",
-			"--builder.deadline=2",
-			"--builder.interval=100ms",
-			"--chain=" + chainConfigPath,
-			"--color=never",
-			"--datadir=" + dataDirPath,
-			"--disable-discovery",
-			"--http",
-			"--http.api=admin,debug,eth,net,trace,txpool,web3,rpc,reth,miner",
-			"--http.addr=127.0.0.1",
-			"--http.port=0",
-			"--ipcdisable",
-			"--log.file.directory=" + logDirPath,
-			"--log.stdout.format=json",
-			"--nat=none",
-			"--p2p-secret-key=" + tempP2PPath,
-			"--port=0",
-			"--rpc.eth-proof-window=30",
-			"--txpool.minimum-priority-fee=1",
-			"--txpool.nolocals",
-			"--with-unused-ports",
-			"--ws",
-			"--ws.api=admin,debug,eth,net,trace,txpool,web3,rpc,reth,miner",
-			"--ws.addr=127.0.0.1",
-			"--ws.port=0",
-			"-vvvv",
-		}
-
-		if areMetricsEnabled() {
-			// NB: Instead of getAvailableLocalPort, we should pass "0" so the OS picks its
-			// own port, but that is not currently logged properly so we cannot parse it.
-			// See: https://github.com/op-rs/op-reth/issues/333
-			metricsPort, err := getAvailableLocalPort()
-			p.Require().NoError(err, "WithOpReth: getting metrics port")
-			args = append(args, "--metrics="+metricsPort)
-		}
-
-		if supervisorRPC != "" {
-			args = append(args, "--rollup.supervisor-http="+supervisorRPC)
-		}
-
-		l2EL := &OpReth{
-			id:                 id,
-			l2Net:              l2Net,
-			jwtPath:            jwtPath,
-			jwtSecret:          jwtSecret,
-			authRPC:            "",
-			userRPC:            "",
-			execPath:           execPath,
-			args:               args,
-			env:                []string{},
-			p:                  orch.p,
-			l2MetricsRegistrar: orch,
-		}
-
-		p.Logger().Info("Starting op-reth")
-		l2EL.Start()
-		p.Cleanup(l2EL.Stop)
-		p.Logger().Info("op-reth is ready", "userRPC", l2EL.userRPC, "authRPC", l2EL.authRPC)
-		require.True(orch.l2ELs.SetIfMissing(id, l2EL), "must be unique L2 EL node")
-	})
 }

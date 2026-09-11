@@ -26,7 +26,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/driver"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/interop"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/sync"
 	oplog "github.com/ethereum-optimism/optimism/op-service/log"
 	"github.com/ethereum-optimism/optimism/op-service/retry"
@@ -308,7 +307,13 @@ func setupBatcher(t *testing.T, sys *e2esys.System, conductors map[string]*condu
 		CompressionAlgo:              derive.Zlib,
 	}
 
-	batcher, err := bss.BatcherServiceFromCLIConfig(context.Background(), "0.0.1", batcherCLIConfig, sys.Cfg.Loggers["batcher"])
+	batcherContext, batcherCancel := context.WithCancel(context.Background())
+	var closeAppFn context.CancelCauseFunc = func(cause error) {
+		t.Fatalf("closeAppFn called, batcher hit a critical error: %v", cause)
+		batcherCancel()
+	}
+
+	batcher, err := bss.BatcherServiceFromCLIConfig(batcherContext, closeAppFn, "0.0.1", batcherCLIConfig, sys.Cfg.Loggers["batcher"])
 	require.NoError(t, err)
 	err = batcher.Start(context.Background())
 	require.NoError(t, err)
@@ -357,7 +362,6 @@ func sequencerCfg(conductorRPCEndpoint config.ConductorRPCFunc) *config.Config {
 			ListenPort:  0,
 			EnableAdmin: true,
 		},
-		InteropConfig:               &interop.Config{},
 		L1EpochPollInterval:         time.Second * 2,
 		RuntimeConfigReloadInterval: time.Minute * 10,
 		ConfigPersistence:           &config.DisabledConfigPersistence{},
@@ -378,46 +382,6 @@ func waitForLeadership(t *testing.T, c *conductor) error {
 			return false, err
 		}
 		return isLeader, nil
-	}
-
-	return wait.For(ctx, 1*time.Second, condition)
-}
-
-func waitForLeadershipChange(t *testing.T, prev *conductor, prevID string, conductors map[string]*conductor, sys *e2esys.System) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	condition := func() (bool, error) {
-		isLeader, err := prev.client.Leader(ctx)
-		if err != nil {
-			return false, err
-		}
-		return !isLeader, nil
-	}
-
-	err := wait.For(ctx, 1*time.Second, condition)
-	require.NoError(t, err)
-
-	ensureOnlyOneLeader(t, sys, conductors)
-	newLeader, err := prev.client.LeaderWithID(ctx)
-	require.NoError(t, err)
-	require.NotEmpty(t, newLeader.ID)
-	require.NotEqual(t, prevID, newLeader.ID, "Expected a new leader")
-	require.NoError(t, waitForSequencerStatusChange(t, sys.RollupClient(newLeader.ID), true))
-
-	return newLeader.ID
-}
-
-func waitForSequencerStatusChange(t *testing.T, rollupClient *sources.RollupClient, active bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	condition := func() (bool, error) {
-		isActive, err := rollupClient.SequencerActive(ctx)
-		if err != nil {
-			return false, err
-		}
-		return isActive == active, nil
 	}
 
 	return wait.For(ctx, 1*time.Second, condition)
@@ -475,31 +439,6 @@ func findFollower(t *testing.T, conductors map[string]*conductor) (string, *cond
 		}
 	}
 	return "", nil
-}
-
-func ensureOnlyOneLeader(t *testing.T, sys *e2esys.System, conductors map[string]*conductor) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	condition := func() (bool, error) {
-		leaders := 0
-		for name, con := range conductors {
-			leader, err := con.client.Leader(ctx)
-			if err != nil {
-				continue
-			}
-			active, err := sys.RollupClient(name).SequencerActive(ctx)
-			if err != nil {
-				continue
-			}
-
-			if leader && active {
-				leaders++
-			}
-		}
-		return leaders == 1, nil
-	}
-	require.NoError(t, wait.For(ctx, 1*time.Second, condition))
 }
 
 func memberIDs(membership *consensus.ClusterMembership) []string {

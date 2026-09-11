@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-acceptance-tests/tests/interop/loadtest"
 	"github.com/ethereum-optimism/optimism/op-core/predeploys"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
+	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
@@ -26,8 +27,8 @@ import (
 )
 
 func TestSafeHeadAdvancesAfterOsaka(gt *testing.T) {
-	t := devtest.SerialT(gt)
-	sys := presets.NewMinimal(t)
+	t := devtest.ParallelT(gt)
+	sys := newMinimalFusaka(t)
 	l1Config := sys.L1Network.Escape().ChainConfig()
 	t.Log("Waiting for Osaka to activate")
 	t.Require().NotNil(l1Config.OsakaTime)
@@ -50,8 +51,8 @@ func TestSafeHeadAdvancesAfterOsaka(gt *testing.T) {
 }
 
 func TestBlobBaseFeeIsCorrectAfterBPOFork(gt *testing.T) {
-	t := devtest.SerialT(gt)
-	sys := presets.NewMinimal(t)
+	t := devtest.ParallelT(gt)
+	sys := newMinimalFusaka(t)
 	t.Log("Waiting for BPO1 to activate")
 	t.Require().NotNil(sys.L1Network.Escape().ChainConfig().BPO1Time)
 	sys.L1EL.WaitForTime(*sys.L1Network.Escape().ChainConfig().BPO1Time)
@@ -126,7 +127,7 @@ func spamBlobs(t devtest.T, sys *presets.Minimal) {
 	eoa := sys.FunderL1.NewFundedEOA(eth.OneTenthEther)
 	signer := txinclude.NewPkSigner(eoa.Key().Priv(), sys.L1Network.ChainID().ToBig())
 	l1ETHClient := sys.L1EL.EthClient()
-	syncEOA := loadtest.NewSyncEOA(txinclude.NewPersistent(signer, struct {
+	syncEOA := dsl.NewSyncEOA(txinclude.NewPersistent(signer, struct {
 		*txinclude.Monitor
 		*txinclude.Resubmitter
 	}{

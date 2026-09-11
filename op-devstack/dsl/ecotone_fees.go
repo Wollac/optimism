@@ -5,8 +5,8 @@ import (
 
 	"github.com/ethereum-optimism/optimism/op-core/predeploys"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
 	"github.com/ethereum-optimism/optimism/op-service/apis"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -44,7 +44,7 @@ func NewEcotoneFees(t devtest.T, l2Network *L2Network) *EcotoneFees {
 }
 
 func (ef *EcotoneFees) ValidateTransaction(from *EOA, to *EOA, amount *big.Int) EcotoneFeesValidationResult {
-	client := ef.l2Network.inner.L2ELNode(match.FirstL2EL).EthClient()
+	client := ef.l2Network.PrimaryEL().EthClient()
 
 	startBalance := from.GetBalance()
 	vaultsBefore := ef.getVaultBalances(client)
@@ -159,7 +159,7 @@ func (ef *EcotoneFees) validateEcotoneFeatures(receipt *types.Receipt, l1Fee *bi
 	ef.require.True(l1Fee.Cmp(big.NewInt(0)) > 0, "L1 fee should be greater than 0 in Ecotone")
 	ef.require.Greater(receipt.GasUsed, uint64(20000), "Gas used should be reasonable for transfer")
 	ef.require.Less(receipt.GasUsed, uint64(50000), "Gas used should not be excessive")
-	ef.require.Greater(receipt.EffectiveGasPrice.Uint64(), uint64(0), "Effective gas price should be > 0")
+	ef.require.Greater(bigs.Uint64Strict(receipt.EffectiveGasPrice), uint64(0), "Effective gas price should be > 0")
 }
 
 func (ef *EcotoneFees) validateReceiptFees(receipt *types.Receipt, l1Fee, vaultBaseFee, vaultL2Fee, receiptBaseFee, receiptL2Fee *big.Int) {

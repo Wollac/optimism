@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"context"
+	"errors"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
@@ -10,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 
 	"github.com/ethereum-optimism/optimism/op-core/forks"
+	"github.com/ethereum-optimism/optimism/op-core/interop/depset"
 	"github.com/ethereum-optimism/optimism/op-node/config"
 	"github.com/ethereum-optimism/optimism/op-node/metrics"
 	"github.com/ethereum-optimism/optimism/op-node/node/safedb"
@@ -24,7 +26,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/rollup/sync"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/event"
-	"github.com/ethereum-optimism/optimism/op-supervisor/supervisor/backend/depset"
 )
 
 // MockL1OriginSelector is a shim to override the origin as sequencer, so we can force it to stay on an older origin.
@@ -40,8 +41,8 @@ func (m *MockL1OriginSelector) FindL1Origin(ctx context.Context, l2Head eth.L2Bl
 	return m.actual.FindL1Origin(ctx, l2Head)
 }
 
-func (m *MockL1OriginSelector) SetRecoverMode(bool) {
-	// noop
+func (m *MockL1OriginSelector) SetRecoverMode(b bool) {
+	m.actual.SetRecoverMode(b)
 }
 
 // L2Sequencer is an actor that functions like a rollup node,
@@ -72,7 +73,7 @@ func NewL2Sequencer(t Testing, log log.Logger, l1 derive.L1Fetcher, blobSrc deri
 	seqStateListener := config.DisabledConfigPersistence{}
 	conduc := &conductor.NoOpConductor{}
 	asyncGossip := async.NoOpGossiper{}
-	seq := sequencing.NewSequencer(t.Ctx(), log, cfg, attrBuilder, l1OriginSelector,
+	seq := sequencing.NewSequencer(t.Ctx(), log, cfg, 0, attrBuilder, l1OriginSelector,
 		seqStateListener, conduc, asyncGossip, metr, ver.engine)
 	opts := event.WithEmitLimiter(
 		// TestSyncBatchType/DerivationWithFlakyL1RPC does *a lot* of quick retries
@@ -98,20 +99,32 @@ func NewL2Sequencer(t Testing, log log.Logger, l1 derive.L1Fetcher, blobSrc deri
 
 // ActL2StartBlock starts building of a new L2 block on top of the head
 func (s *L2Sequencer) ActL2StartBlock(t Testing) {
+	err := s.ActMaybeL2StartBlock(t)
+	require.NoError(t, err, "failed to start block building")
+}
+
+// ActMaybeL2StartBlock tries to start building a new L2 block on top of the head
+func (s *L2Sequencer) ActMaybeL2StartBlock(t Testing) error {
 	require.NoError(t, s.drainer.Drain()) // can't build when other work is still blocking
 	if !s.L2PipelineIdle {
 		t.InvalidAction("cannot start L2 build when derivation is not idle")
-		return
+		return nil
 	}
 	if s.l2Building {
 		t.InvalidAction("already started building L2 block")
-		return
+		return nil
 	}
-	s.synchronousEvents.Emit(t.Ctx(), sequencing.SequencerActionEvent{})
-	require.NoError(t, s.drainer.DrainUntil(event.Is[engine.BuildStartedEvent], false),
-		"failed to start block building")
-
+	s.sequencer.RunAction()
+	if err := s.drainer.Drain(); err != nil {
+		return err
+	}
+	// Assert the job exists rather than that some event was seen: several
+	// failure paths also emit a forkchoice update without starting a build.
+	if s.sequencer.Building().Info.ID == (eth.PayloadID{}) {
+		return errors.New("sequencer did not start a block-building job")
+	}
 	s.l2Building = true
+	return nil
 }
 
 // ActL2EndBlock completes a new L2 block and applies it to the L2 chain as new canonical unsafe head
@@ -122,8 +135,8 @@ func (s *L2Sequencer) ActL2EndBlock(t Testing) eth.L2BlockRef {
 	}
 	s.l2Building = false
 
-	s.synchronousEvents.Emit(t.Ctx(), sequencing.SequencerActionEvent{})
-	require.NoError(t, s.drainer.DrainUntil(event.Is[engine.PayloadSuccessEvent], false),
+	s.sequencer.RunAction()
+	require.NoError(t, s.drainer.DrainUntil(event.Is[engine.UnsafeUpdateEvent], false),
 		"failed to complete block building")
 
 	// After having built a L2 block, make sure to get an engine update processed,
@@ -267,8 +280,12 @@ func (s *L2Sequencer) ActBuildL2ToIsthmus(t Testing) {
 // we can use ActBuildL2ToTime with (e.g.) the JovianTime.
 
 func (s *L2Sequencer) ActBuildL2ToInterop(t Testing) {
-	require.NotNil(t, s.RollupCfg.InteropTime, "cannot activate InteropTime when it is not scheduled")
-	for s.L2Unsafe().Time < *s.RollupCfg.InteropTime {
+	require.NotNil(t, s.RollupCfg.LagoonTime, "cannot activate LagoonTime when it is not scheduled")
+	for s.L2Unsafe().Time < *s.RollupCfg.LagoonTime {
 		s.ActL2EmptyBlock(t)
 	}
+}
+
+func (s *L2Sequencer) ActSetRecoverMode(t Testing, b bool) {
+	s.sequencer.SetRecoverMode(b)
 }

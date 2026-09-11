@@ -5,19 +5,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum-optimism/optimism/op-acceptance-tests/tests/custom_gas_token"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl/contract"
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
 	"github.com/ethereum-optimism/optimism/op-service/txplan"
-	supervisorTypes "github.com/ethereum-optimism/optimism/op-supervisor/supervisor/types"
+
+	safety "github.com/ethereum-optimism/optimism/op-service/eth/safety"
 )
 
 func TestL1ToL2Deposit(gt *testing.T) {
 	// Create a test environment using op-devstack
-	t := devtest.SerialT(gt)
+	t := devtest.ParallelT(gt)
 	sys := presets.NewMinimal(t)
+
+	// Skip this test if CGT is enabled
+	custom_gas_token.SkipIfCGT(t, sys)
 
 	// Wait for L1 node to be responsive
 	sys.L1Network.WaitForOnline()
@@ -27,7 +33,6 @@ func TestL1ToL2Deposit(gt *testing.T) {
 	alice := sys.FunderL1.NewFundedEOA(fundingAmount)
 	t.Log("Alice L1 address", alice.Address())
 
-	alice.WaitForBalance(fundingAmount)
 	initialBalance := alice.GetBalance()
 	t.Log("Alice L1 balance", initialBalance)
 
@@ -59,8 +64,8 @@ func TestL1ToL2Deposit(gt *testing.T) {
 
 	// Wait for the sequencer to process the deposit
 	t.Require().Eventually(func() bool {
-		head := sys.L2CL.HeadBlockRef(supervisorTypes.LocalUnsafe)
-		return head.L1Origin.Number >= receipt.BlockNumber.Uint64()
+		head := sys.L2CL.HeadBlockRef(safety.LocalUnsafe)
+		return head.L1Origin.Number >= bigs.Uint64Strict(receipt.BlockNumber)
 	}, sys.L1EL.TransactionTimeout(), time.Second, "awaiting deposit to be processed by L2")
 
 	alicel2.WaitForBalance(initialL2Balance.Add(depositAmount))

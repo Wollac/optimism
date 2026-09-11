@@ -3,29 +3,32 @@
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
-- [Standards and Conventions](#standards-and-conventions)
-  - [Style](#style)
-    - [Comments](#comments)
-    - [Errors](#errors)
-    - [Function Parameters](#function-parameters)
-    - [Function Return Arguments](#function-return-arguments)
-    - [Event Parameters](#event-parameters)
-    - [Immutable variables](#immutable-variables)
-    - [Spacers](#spacers)
-  - [Proxy by Default](#proxy-by-default)
-  - [Versioning](#versioning)
-    - [Exceptions](#exceptions)
-  - [Dependencies](#dependencies)
-  - [Source Code](#source-code)
-  - [Tests](#tests)
-    - [Expect Revert with Low Level Calls](#expect-revert-with-low-level-calls)
-    - [Organizing Principles](#organizing-principles)
-    - [Test function naming convention](#test-function-naming-convention)
-      - [Detailed Naming Rules](#detailed-naming-rules)
-    - [Contract Naming Conventions](#contract-naming-conventions)
-    - [Test File Organization](#test-file-organization)
-    - [Test Naming Exceptions](#test-naming-exceptions)
-- [Withdrawing From Fee Vaults](#withdrawing-from-fee-vaults)
+- [Smart Contract Style Guide](#smart-contract-style-guide)
+  - [Standards and Conventions](#standards-and-conventions)
+    - [Style](#style)
+      - [Comments](#comments)
+      - [Errors](#errors)
+      - [Function Parameters](#function-parameters)
+      - [Function Return Arguments](#function-return-arguments)
+      - [Event Parameters](#event-parameters)
+      - [Immutable variables](#immutable-variables)
+      - [Struct typed storage variables](#struct-typed-storage-variables)
+      - [Spacers](#spacers)
+    - [Proxy by Default](#proxy-by-default)
+    - [Versioning](#versioning)
+      - [Exceptions](#exceptions)
+    - [Dependencies](#dependencies)
+    - [Interface Inheritance](#interface-inheritance)
+    - [Source Code](#source-code)
+    - [Tests](#tests)
+      - [Expect Revert with Low Level Calls](#expect-revert-with-low-level-calls)
+      - [Gas Accounting in Tests](#gas-accounting-in-tests)
+      - [Organizing Principles](#organizing-principles)
+      - [Test function naming convention](#test-function-naming-convention)
+        - [Detailed Naming Rules](#detailed-naming-rules)
+      - [Contract Naming Conventions](#contract-naming-conventions)
+      - [Test File Organization](#test-file-organization)
+      - [Test Naming Exceptions](#test-naming-exceptions)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -181,6 +184,48 @@ contract ExampleWithImmutable {
 }
 ```
 
+#### Struct typed storage variables
+
+Struct typed storage variables:
+
+- should be `internal` with a `_` prefix on the variable name
+- should have a hand written getter function that returns the struct type
+- the getter should be named after the variable, minus the `_` prefix.
+- if necessary to avoid a naming collision, the getter function can be prefixed with `get`.
+
+When a struct typed storage variable is declared as `public`, Solidity's auto-generated getter returns
+the struct fields as a tuple rather than as the struct type itself. This makes the contract
+interface less ergonomic for external consumers. By using `internal` visibility and writing a
+manual getter, we can return the proper struct type.
+
+Example:
+
+```solidity
+contract ExampleWithStruct {
+    struct Config {
+        address owner;
+        uint256 timeout;
+        bool enabled;
+    }
+
+    // ❌ Incorrect - public struct variable returns tuple
+    Config public config;
+    // The auto-generated getter: function config() returns (address, uint256, bool)
+
+    // ✅ Correct - internal variable with handwritten getter returns struct
+    Config internal _config;
+
+    function config() public view returns (Config memory) {
+        return _config;
+    }
+
+    // Also acceptable if necessary to prevent naming collisions
+    function getConfig() public view returns (Config memory) {
+        return _config;
+    }
+}
+```
+
 #### Spacers
 
 We use spacer variables to account for old storage slots that are no longer being used.
@@ -208,8 +253,8 @@ contract BadStorageLayout {
 
 All contracts should be assumed to live behind proxies (except in certain special circumstances).
 This means that new contracts MUST be built under the assumption of upgradeability.
-We use a minimal [`Proxy`](../src/universal/Proxy.sol) contract designed to be owned by a
-corresponding [`ProxyAdmin`](../src/universal/ProxyAdmin.sol) which follow the interfaces
+We use a minimal [`Proxy`](../../../src/universal/Proxy.sol) contract designed to be owned by a
+corresponding [`ProxyAdmin`](../../../src/universal/ProxyAdmin.sol) which follow the interfaces
 of OpenZeppelin's `Proxy` and `ProxyAdmin` contracts, respectively.
 
 Unless explicitly discussed otherwise, you MUST include the following basic upgradeability
@@ -238,6 +283,8 @@ Additionally, contracts MUST use the following versioning scheme when incrementi
 - `patch` releases are to be used only for changes that do NOT modify contract bytecode (such as updating comments).
 - `minor` releases are to be used for changes that modify bytecode OR changes that expand the contract ABI provided that these changes do NOT break the existing interface.
 - `major` releases are to be used for changes that break the existing contract interface OR changes that modify the security model of a contract.
+
+Version bumps should be done **once per PR**, not per commit. Since PRs are squash-merged, only one commit appears in the git history. The version should reflect the aggregate change from the PR's base branch.
 
 The remainder of the contract versioning and release process can be found in [`VERSIONING.md](../policies/VERSIONING.md).
 
@@ -317,6 +364,12 @@ There is a non-intuitive behavior in foundry tests, which is documented [here](h
 When testing for a revert on a low-level call, please use the `revertsAsExpected` pattern suggested there.
 
 _Note: This is a work in progress, not all test files are compliant with these guidelines._
+
+#### Gas Accounting in Tests
+
+Foundry's default test runner does not deduct intrinsic gas (21,000 base, plus 16 per non-zero byte and 4 per zero byte of calldata) before forwarding to the called contract. Real Ethereum clients do. Tests that pass `gasLimit` straight through to a call therefore have *more* gas to spend than production would, and code that fits its budget under test can run out of gas onchain. This caused the upgrade-path bug fixed in [#20075](https://github.com/ethereum-optimism/optimism/pull/20075).
+
+Two correct patterns: deduct intrinsic gas manually before the call (`gas: _txn.gasLimit - intrinsicGas_`), or run the test under `forge-config: default.isolate = true`, which makes Foundry execute each top-level call as a separate transaction with proper gas accounting. Use the manual path for tests that drive many top-level calls in one harness and need to control gas precisely; use isolate mode for end-to-end tests that should mirror real client semantics.
 
 #### Organizing Principles
 

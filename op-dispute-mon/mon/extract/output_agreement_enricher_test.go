@@ -26,27 +26,27 @@ func TestOutputAgreementEnricher(t *testing.T) {
 	t.Run("ErrorWhenNoRollupClient", func(t *testing.T) {
 		validator, _, _ := setupOutputValidatorTest(t)
 		validator.clients = nil
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:            200,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.ErrorIs(t, err, ErrRollupRpcRequired)
 	})
 
 	t.Run("SkipNonOutputRootGameTypes", func(t *testing.T) {
-		gameTypes := []uint32{4, 5, 7, 8, 10, 49812}
+		gameTypes := []uint32{4, 5, 7, 9, 11, 49812}
 		for _, gameType := range gameTypes {
 			gameType := gameType
 			t.Run(fmt.Sprintf("GameType_%d", gameType), func(t *testing.T) {
 				validator, _, metrics := setupOutputValidatorTest(t)
 				validator.clients = nil // Should not error even though there's no rollup client
-				game := &types.EnrichedGameData{
+				game := &types.CommonGameData{
 					GameMetadata: challengerTypes.GameMetadata{
 						GameType: gameType,
 					},
@@ -67,7 +67,7 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			gameType := gameType
 			t.Run(fmt.Sprintf("GameType_%d", gameType), func(t *testing.T) {
 				validator, _, metrics := setupOutputValidatorTest(t)
-				game := &types.EnrichedGameData{
+				game := &types.CommonGameData{
 					GameMetadata: challengerTypes.GameMetadata{
 						GameType: gameType,
 					},
@@ -82,16 +82,16 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		}
 	})
 
-	t.Run("AllNodesReturnError", func(t *testing.T) {
+	t.Run("RecoversAfterAllNodesReturnError", func(t *testing.T) {
 		validator, clients, metrics := setupMultiNodeTest(t, 3)
 		for _, client := range clients {
 			client.outputErr = errors.New("boom")
 		}
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.Error(t, err)
@@ -99,6 +99,21 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		require.Equal(t, common.Hash{}, game.ExpectedRootClaim)
 		require.False(t, game.AgreeWithClaim)
 		require.Zero(t, metrics.fetchTime)
+
+		for _, client := range clients {
+			client.outputErr = nil
+		}
+		game = &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+		err = validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+		require.Equal(t, mockRootClaim, game.ExpectedRootClaim)
+		require.True(t, game.AgreeWithClaim)
+		require.NotZero(t, metrics.fetchTime)
 	})
 
 	t.Run("AllNodesReturnNotFound", func(t *testing.T) {
@@ -106,11 +121,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		for _, client := range clients {
 			client.outputErr = mockNotFoundRPCError()
 		}
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -124,7 +139,7 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].currentL1 = 99
 		clients[1].currentL1 = 100 // Out of sync because it is only equal to the game L1 head
 		clients[2].currentL1 = 0
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			L1HeadNum:        100,
 			L2SequenceNumber: 0,
 			RootClaim:        mockRootClaim,
@@ -141,7 +156,7 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].currentL1 = 99
 		// Would disagree but will be ignored because node is not in sync
 		clients[0].outputRoot = common.Hash{0xaa, 0xbb, 0xcc, 0xdd}
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			L1HeadNum:        100,
 			L2SequenceNumber: 0,
 			RootClaim:        mockRootClaim,
@@ -158,11 +173,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].outputErr = mockNotFoundRPCError()
 		clients[1].outputErr = nil
 		clients[2].outputErr = nil
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -179,11 +194,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[2].safeHeadNum = 100
 		clients[3].outputRoot = mockRootClaim
 		clients[3].safeHeadNum = 100
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     50,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -198,11 +213,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].outputErr = mockNotFoundRPCError()
 		clients[1].outputRoot = differentRoot
 		clients[2].outputRoot = differentRoot
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     50,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -217,11 +232,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].outputRoot = mockRootClaim
 		clients[1].outputRoot = divergedRoot
 		clients[2].outputRoot = divergedRoot
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -235,11 +250,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].safeHeadNum = 100
 		clients[1].safeHeadNum = 99
 		clients[2].safeHeadNum = 101
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -253,11 +268,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].safeHeadErr = errors.New("boom")
 		clients[1].safeHeadErr = nil
 		clients[2].safeHeadErr = nil
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     0,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -271,11 +286,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		clients[0].safeHeadNum = 50
 		clients[1].safeHeadNum = 60
 		clients[2].safeHeadNum = 70
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     80,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   80,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -292,11 +307,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			client.safeHeadNum = 40
 		}
 
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     50, // Higher than all safe heads
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   50, // Higher than all safe heads
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
@@ -315,11 +330,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			// Safe head numbers don't matter here since the output doesn't match the claim
 		}
 
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     50,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
@@ -334,11 +349,11 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		// RPC block numbers must be a int64 to be valid. Anything bigger than that should be treated as invalid
 		// without even making a request to the node.
 		rollup.outputErr = errors.New("should not have even requested the output root")
-		game := &types.EnrichedGameData{
-			L1HeadNum:            100,
-			L2SequenceNumber:     uint64(math.MaxInt64) + 1,
-			RootClaim:            mockRootClaim,
-			RollupEndpointErrors: make(map[string]bool),
+		game := &types.CommonGameData{
+			L1HeadNum:          100,
+			L2SequenceNumber:   uint64(math.MaxInt64) + 1,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -351,19 +366,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		t.Run("SingleNodeError", func(t *testing.T) {
 			validator, client, _ := setupOutputValidatorTest(t)
 			client.outputErr = errors.New("connection failed")
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:            200,
-				L2SequenceNumber:     100,
-				RootClaim:            mockRootClaim,
-				RollupEndpointErrors: make(map[string]bool),
+				L1HeadNum:          200,
+				L2SequenceNumber:   100,
+				RootClaim:          mockRootClaim,
+				NodeEndpointErrors: make(map[string]bool),
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.ErrorIs(t, err, ErrAllNodesUnavailable)
-			require.NotNil(t, game.RollupEndpointErrors)
-			require.Contains(t, game.RollupEndpointErrors, "client-0")
+			require.NotNil(t, game.NodeEndpointErrors)
+			require.Contains(t, game.NodeEndpointErrors, "client-0")
 		})
 
 		t.Run("MultiNodeErrors", func(t *testing.T) {
@@ -372,40 +387,40 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[2].outputErr = errors.New("server error")
 			// clients[1] will succeed
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:            200,
-				L2SequenceNumber:     100,
-				RootClaim:            mockRootClaim,
-				RollupEndpointErrors: make(map[string]bool),
+				L1HeadNum:          200,
+				L2SequenceNumber:   100,
+				RootClaim:          mockRootClaim,
+				NodeEndpointErrors: make(map[string]bool),
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.NotNil(t, game.RollupEndpointErrors)
-			require.Contains(t, game.RollupEndpointErrors, "client-0")
-			require.Contains(t, game.RollupEndpointErrors, "client-2")
-			require.NotContains(t, game.RollupEndpointErrors, "client-1")
-			require.Len(t, game.RollupEndpointErrors, 2)
+			require.NotNil(t, game.NodeEndpointErrors)
+			require.Contains(t, game.NodeEndpointErrors, "client-0")
+			require.Contains(t, game.NodeEndpointErrors, "client-2")
+			require.NotContains(t, game.NodeEndpointErrors, "client-1")
+			require.Len(t, game.NodeEndpointErrors, 2)
 		})
 
 		t.Run("NotFoundErrorsNotRecorded", func(t *testing.T) {
 			validator, client, _ := setupOutputValidatorTest(t)
 			client.outputErr = mockNotFoundRPCError()
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:            200,
-				L2SequenceNumber:     100,
-				RootClaim:            mockRootClaim,
-				RollupEndpointErrors: make(map[string]bool),
+				L1HeadNum:          200,
+				L2SequenceNumber:   100,
+				RootClaim:          mockRootClaim,
+				NodeEndpointErrors: make(map[string]bool),
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.NotNil(t, game.RollupEndpointErrors)
-			require.Empty(t, game.RollupEndpointErrors)
+			require.NotNil(t, game.NodeEndpointErrors)
+			require.Empty(t, game.NodeEndpointErrors)
 		})
 
 	})
@@ -414,19 +429,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 		t.Run("SingleNodeErrorCount", func(t *testing.T) {
 			validator, client, _ := setupOutputValidatorTest(t)
 			client.outputErr = errors.New("connection failed")
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                200,
-				L2SequenceNumber:         100,
-				RootClaim:                mockRootClaim,
-				RollupEndpointErrors:     make(map[string]bool),
-				RollupEndpointErrorCount: 0,
+				L1HeadNum:              200,
+				L2SequenceNumber:       100,
+				RootClaim:              mockRootClaim,
+				NodeEndpointErrors:     make(map[string]bool),
+				NodeEndpointErrorCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.ErrorIs(t, err, ErrAllNodesUnavailable)
-			require.Equal(t, 1, game.RollupEndpointErrorCount)
+			require.Equal(t, 1, game.NodeEndpointErrorCount)
 		})
 
 		t.Run("MultiNodeErrorCount", func(t *testing.T) {
@@ -436,19 +451,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[2].outputErr = errors.New("another error")
 			// clients[3] will succeed
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                200,
-				L2SequenceNumber:         100,
-				RootClaim:                mockRootClaim,
-				RollupEndpointErrors:     make(map[string]bool),
-				RollupEndpointErrorCount: 0,
+				L1HeadNum:              200,
+				L2SequenceNumber:       100,
+				RootClaim:              mockRootClaim,
+				NodeEndpointErrors:     make(map[string]bool),
+				NodeEndpointErrorCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 3, game.RollupEndpointErrorCount)
+			require.Equal(t, 3, game.NodeEndpointErrorCount)
 		})
 
 		t.Run("NotFoundErrorsNotCounted", func(t *testing.T) {
@@ -457,19 +472,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[1].outputErr = mockNotFoundRPCError()
 			// clients[2] will succeed
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                200,
-				L2SequenceNumber:         100,
-				RootClaim:                mockRootClaim,
-				RollupEndpointErrors:     make(map[string]bool),
-				RollupEndpointErrorCount: 0,
+				L1HeadNum:              200,
+				L2SequenceNumber:       100,
+				RootClaim:              mockRootClaim,
+				NodeEndpointErrors:     make(map[string]bool),
+				NodeEndpointErrorCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 0, game.RollupEndpointErrorCount)
+			require.Equal(t, 0, game.NodeEndpointErrorCount)
 		})
 
 		t.Run("MixedErrorTypes", func(t *testing.T) {
@@ -479,19 +494,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[2].outputErr = errors.New("server error")     // Should be counted
 			// clients[3] will succeed
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                200,
-				L2SequenceNumber:         100,
-				RootClaim:                mockRootClaim,
-				RollupEndpointErrors:     make(map[string]bool),
-				RollupEndpointErrorCount: 0,
+				L1HeadNum:              200,
+				L2SequenceNumber:       100,
+				RootClaim:              mockRootClaim,
+				NodeEndpointErrors:     make(map[string]bool),
+				NodeEndpointErrorCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 2, game.RollupEndpointErrorCount)
+			require.Equal(t, 2, game.NodeEndpointErrorCount)
 		})
 	})
 
@@ -503,19 +518,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[1].currentL1 = 400
 			clients[2].currentL1 = 500
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                    200,
-				L2SequenceNumber:             100,
-				RootClaim:                    mockRootClaim,
-				RollupEndpointErrors:         make(map[string]bool),
-				RollupEndpointOutOfSyncCount: 0,
+				L1HeadNum:                  200,
+				L2SequenceNumber:           100,
+				RootClaim:                  mockRootClaim,
+				NodeEndpointErrors:         make(map[string]bool),
+				NodeEndpointOutOfSyncCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 0, game.RollupEndpointOutOfSyncCount)
+			require.Equal(t, 0, game.NodeEndpointOutOfSyncCount)
 		})
 
 		t.Run("SingleNodeOutOfSync", func(t *testing.T) {
@@ -524,19 +539,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[1].currentL1 = 300
 			clients[2].currentL1 = 400
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                    200,
-				L2SequenceNumber:             100,
-				RootClaim:                    mockRootClaim,
-				RollupEndpointErrors:         make(map[string]bool),
-				RollupEndpointOutOfSyncCount: 0,
+				L1HeadNum:                  200,
+				L2SequenceNumber:           100,
+				RootClaim:                  mockRootClaim,
+				NodeEndpointErrors:         make(map[string]bool),
+				NodeEndpointOutOfSyncCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 1, game.RollupEndpointOutOfSyncCount)
+			require.Equal(t, 1, game.NodeEndpointOutOfSyncCount)
 		})
 
 		t.Run("MultipleNodesOutOfSync", func(t *testing.T) {
@@ -546,19 +561,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[2].currentL1 = 50  // Out of sync
 			clients[3].currentL1 = 300 // In sync
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                    200,
-				L2SequenceNumber:             100,
-				RootClaim:                    mockRootClaim,
-				RollupEndpointErrors:         make(map[string]bool),
-				RollupEndpointOutOfSyncCount: 0,
+				L1HeadNum:                  200,
+				L2SequenceNumber:           100,
+				RootClaim:                  mockRootClaim,
+				NodeEndpointErrors:         make(map[string]bool),
+				NodeEndpointOutOfSyncCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 3, game.RollupEndpointOutOfSyncCount)
+			require.Equal(t, 3, game.NodeEndpointOutOfSyncCount)
 		})
 
 		t.Run("AllNodesOutOfSync", func(t *testing.T) {
@@ -567,19 +582,19 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[1].currentL1 = 100 // Equal to game L1 head, considered out of sync
 			clients[2].currentL1 = 0
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                    200,
-				L2SequenceNumber:             100,
-				RootClaim:                    mockRootClaim,
-				RollupEndpointErrors:         make(map[string]bool),
-				RollupEndpointOutOfSyncCount: 0,
+				L1HeadNum:                  200,
+				L2SequenceNumber:           100,
+				RootClaim:                  mockRootClaim,
+				NodeEndpointErrors:         make(map[string]bool),
+				NodeEndpointOutOfSyncCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.ErrorIs(t, err, ErrAllNodesUnavailable)
-			require.Equal(t, 3, game.RollupEndpointOutOfSyncCount)
+			require.Equal(t, 3, game.NodeEndpointOutOfSyncCount)
 		})
 
 		t.Run("MixedOutOfSyncAndErrors", func(t *testing.T) {
@@ -590,21 +605,21 @@ func TestOutputAgreementEnricher(t *testing.T) {
 			clients[3].outputErr = mockNotFoundRPCError() // Not found (not counted as error)
 			clients[4].currentL1 = 300                    // In sync and succeeds
 
-			game := &types.EnrichedGameData{
+			game := &types.CommonGameData{
 				GameMetadata: challengerTypes.GameMetadata{
 					GameType: 0,
 				},
-				L1HeadNum:                    200,
-				L2SequenceNumber:             100,
-				RootClaim:                    mockRootClaim,
-				RollupEndpointErrors:         make(map[string]bool),
-				RollupEndpointErrorCount:     0,
-				RollupEndpointOutOfSyncCount: 0,
+				L1HeadNum:                  200,
+				L2SequenceNumber:           100,
+				RootClaim:                  mockRootClaim,
+				NodeEndpointErrors:         make(map[string]bool),
+				NodeEndpointErrorCount:     0,
+				NodeEndpointOutOfSyncCount: 0,
 			}
 			err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 			require.NoError(t, err)
-			require.Equal(t, 2, game.RollupEndpointOutOfSyncCount, "should count 2 out-of-sync nodes")
-			require.Equal(t, 1, game.RollupEndpointErrorCount, "should count 1 error (not found is not an error)")
+			require.Equal(t, 2, game.NodeEndpointOutOfSyncCount, "should count 2 out-of-sync nodes")
+			require.Equal(t, 1, game.NodeEndpointErrorCount, "should count 1 error (not found is not an error)")
 		})
 	})
 }
@@ -712,23 +727,23 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 		clients[2].outputRoot = rootClaim
 		clients[2].safeHeadNum = 150
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                 200,
-			L2SequenceNumber:          75,
-			RootClaim:                 rootClaim,
-			RollupEndpointErrors:      make(map[string]bool),
-			RollupEndpointSafeCount:   0,
-			RollupEndpointUnsafeCount: 0,
+			L1HeadNum:               200,
+			L2SequenceNumber:        75,
+			RootClaim:               rootClaim,
+			NodeEndpointErrors:      make(map[string]bool),
+			NodeEndpointSafeCount:   0,
+			NodeEndpointUnsafeCount: 0,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
 
-		require.Equal(t, 2, game.RollupEndpointSafeCount, "Should count 2 safe endpoints")
-		require.Equal(t, 1, game.RollupEndpointUnsafeCount, "Should count 1 unsafe endpoint")
+		require.Equal(t, 2, game.NodeEndpointSafeCount, "Should count 2 safe endpoints")
+		require.Equal(t, 1, game.NodeEndpointUnsafeCount, "Should count 1 unsafe endpoint")
 		require.True(t, game.HasMixedSafety(), "Should have mixed safety")
 	})
 
@@ -743,23 +758,23 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 			client.safeHeadNum = 100 // All would be safe if checked
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                 200,
-			L2SequenceNumber:          75,
-			RootClaim:                 rootClaim,
-			RollupEndpointErrors:      make(map[string]bool),
-			RollupEndpointSafeCount:   0,
-			RollupEndpointUnsafeCount: 0,
+			L1HeadNum:               200,
+			L2SequenceNumber:        75,
+			RootClaim:               rootClaim,
+			NodeEndpointErrors:      make(map[string]bool),
+			NodeEndpointSafeCount:   0,
+			NodeEndpointUnsafeCount: 0,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
 
-		require.Equal(t, 0, game.RollupEndpointSafeCount, "Should not count safety when output root differs")
-		require.Equal(t, 0, game.RollupEndpointUnsafeCount, "Should not count safety when output root differs")
+		require.Equal(t, 0, game.NodeEndpointSafeCount, "Should not count safety when output root differs")
+		require.Equal(t, 0, game.NodeEndpointUnsafeCount, "Should not count safety when output root differs")
 		require.False(t, game.HasMixedSafety(), "Should not have mixed safety")
 	})
 
@@ -778,23 +793,23 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 		clients[2].outputRoot = rootClaim
 		clients[2].safeHeadNum = 50
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                 200,
-			L2SequenceNumber:          75,
-			RootClaim:                 rootClaim,
-			RollupEndpointErrors:      make(map[string]bool),
-			RollupEndpointSafeCount:   0,
-			RollupEndpointUnsafeCount: 0,
+			L1HeadNum:               200,
+			L2SequenceNumber:        75,
+			RootClaim:               rootClaim,
+			NodeEndpointErrors:      make(map[string]bool),
+			NodeEndpointSafeCount:   0,
+			NodeEndpointUnsafeCount: 0,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
 
-		require.Equal(t, 1, game.RollupEndpointSafeCount, "Should count only found safe endpoints")
-		require.Equal(t, 1, game.RollupEndpointUnsafeCount, "Should count only found unsafe endpoints")
+		require.Equal(t, 1, game.NodeEndpointSafeCount, "Should count only found safe endpoints")
+		require.Equal(t, 1, game.NodeEndpointUnsafeCount, "Should count only found unsafe endpoints")
 		require.True(t, game.HasMixedSafety(), "Should have mixed safety")
 	})
 
@@ -808,23 +823,23 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 			client.safeHeadNum = 100
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                 200,
-			L2SequenceNumber:          75,
-			RootClaim:                 rootClaim,
-			RollupEndpointErrors:      make(map[string]bool),
-			RollupEndpointSafeCount:   0,
-			RollupEndpointUnsafeCount: 0,
+			L1HeadNum:               200,
+			L2SequenceNumber:        75,
+			RootClaim:               rootClaim,
+			NodeEndpointErrors:      make(map[string]bool),
+			NodeEndpointSafeCount:   0,
+			NodeEndpointUnsafeCount: 0,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
 
-		require.Equal(t, 3, game.RollupEndpointSafeCount, "Should count all safe endpoints")
-		require.Equal(t, 0, game.RollupEndpointUnsafeCount, "Should count no unsafe endpoints")
+		require.Equal(t, 3, game.NodeEndpointSafeCount, "Should count all safe endpoints")
+		require.Equal(t, 0, game.NodeEndpointUnsafeCount, "Should count no unsafe endpoints")
 		require.False(t, game.HasMixedSafety(), "Should not have mixed safety")
 	})
 
@@ -837,20 +852,20 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 		clients[1].outputRoot = divergedRoot
 		clients[2].outputRoot = divergedRoot
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                          100,
-			L2SequenceNumber:                   0,
-			RootClaim:                          mockRootClaim,
-			RollupEndpointErrors:               make(map[string]bool),
-			RollupEndpointDifferentOutputRoots: false,
+			L1HeadNum:                  100,
+			L2SequenceNumber:           0,
+			RootClaim:                  mockRootClaim,
+			NodeEndpointErrors:         make(map[string]bool),
+			NodeEndpointDifferentRoots: false,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
-		require.True(t, game.RollupEndpointDifferentOutputRoots, "Should track different output roots")
+		require.True(t, game.NodeEndpointDifferentRoots, "Should track different output roots")
 	})
 
 	t.Run("DoesNotTrackDifferentOutputRootsWhenNodesAgree", func(t *testing.T) {
@@ -861,20 +876,20 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 			client.outputRoot = mockRootClaim
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                          100,
-			L2SequenceNumber:                   0,
-			RootClaim:                          mockRootClaim,
-			RollupEndpointErrors:               make(map[string]bool),
-			RollupEndpointDifferentOutputRoots: false,
+			L1HeadNum:                  100,
+			L2SequenceNumber:           0,
+			RootClaim:                  mockRootClaim,
+			NodeEndpointErrors:         make(map[string]bool),
+			NodeEndpointDifferentRoots: false,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
-		require.False(t, game.RollupEndpointDifferentOutputRoots, "Should not track different output roots when nodes agree")
+		require.False(t, game.NodeEndpointDifferentRoots, "Should not track different output roots when nodes agree")
 	})
 
 	t.Run("DoesNotTrackDifferentOutputRootsForMixedAvailability", func(t *testing.T) {
@@ -885,20 +900,20 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 		clients[1].outputRoot = mockRootClaim
 		clients[2].outputErr = mockNotFoundRPCError() // This client returns "not found"
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                          100,
-			L2SequenceNumber:                   0,
-			RootClaim:                          mockRootClaim,
-			RollupEndpointErrors:               make(map[string]bool),
-			RollupEndpointDifferentOutputRoots: false,
+			L1HeadNum:                  100,
+			L2SequenceNumber:           0,
+			RootClaim:                  mockRootClaim,
+			NodeEndpointErrors:         make(map[string]bool),
+			NodeEndpointDifferentRoots: false,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
-		require.False(t, game.RollupEndpointDifferentOutputRoots, "Should not track different output roots for mixed availability")
+		require.False(t, game.NodeEndpointDifferentRoots, "Should not track different output roots for mixed availability")
 		require.True(t, game.HasMixedAvailability(), "Should have mixed availability")
 	})
 
@@ -911,20 +926,20 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 		clients[1].outputRoot = mockRootClaim
 		clients[2].outputRoot = divergedRoot
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                          100,
-			L2SequenceNumber:                   0,
-			RootClaim:                          mockRootClaim,
-			RollupEndpointErrors:               make(map[string]bool),
-			RollupEndpointDifferentOutputRoots: false,
+			L1HeadNum:                  100,
+			L2SequenceNumber:           0,
+			RootClaim:                  mockRootClaim,
+			NodeEndpointErrors:         make(map[string]bool),
+			NodeEndpointDifferentRoots: false,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
-		require.True(t, game.RollupEndpointDifferentOutputRoots, "Should track different output roots even with single disagreeing node")
+		require.True(t, game.NodeEndpointDifferentRoots, "Should track different output roots even with single disagreeing node")
 	})
 
 	t.Run("DoesNotTrackDifferentOutputRootsWithOnlyErrors", func(t *testing.T) {
@@ -935,19 +950,19 @@ func TestOutputAgreementEnricher_SafetyCounting(t *testing.T) {
 			client.outputErr = errors.New("rpc error")
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
 				GameType: 0,
 			},
-			L1HeadNum:                          100,
-			L2SequenceNumber:                   0,
-			RootClaim:                          mockRootClaim,
-			RollupEndpointErrors:               make(map[string]bool),
-			RollupEndpointDifferentOutputRoots: false,
+			L1HeadNum:                  100,
+			L2SequenceNumber:           0,
+			RootClaim:                  mockRootClaim,
+			NodeEndpointErrors:         make(map[string]bool),
+			NodeEndpointDifferentRoots: false,
 		}
 
 		err := enricher.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.ErrorIs(t, err, ErrAllNodesUnavailable)
-		require.False(t, game.RollupEndpointDifferentOutputRoots, "Should not track different output roots when all nodes error")
+		require.False(t, game.NodeEndpointDifferentRoots, "Should not track different output roots when all nodes error")
 	})
 }

@@ -64,9 +64,8 @@ The Optimism Immunefi program offers up to $2,000,042 for in-scope critical vuln
 
 <pre>
 ├── <a href="./cannon">cannon</a>: Onchain MIPS instruction emulator for fault proofs
-├── <a href="./devnet-sdk">devnet-sdk</a>: Comprehensive toolkit for standardized devnet interactions
 ├── <a href="./docs">docs</a>: A collection of documents including audits and post-mortems
-├── <a href="./kurtosis-devnet">kurtosis-devnet</a>: OP-Stack Kurtosis devnet
+│   └── <a href="./docs/public-docs">public-docs</a>: Public developer documentation for <a href="https://docs.optimism.io">docs.optimism.io</a>
 ├── <a href="./op-acceptance-tests">op-acceptance-tests</a>: Acceptance tests and configuration for OP Stack
 ├── <a href="./op-alt-da">op-alt-da</a>: Alternative Data Availability mode (beta)
 ├── <a href="./op-batcher">op-batcher</a>: L2-Batch Submitter, submits bundles of batches to L1
@@ -83,18 +82,25 @@ The Optimism Immunefi program offers up to $2,000,042 for in-scope critical vuln
 ├── <a href="./op-interop-mon">op-interop-mon</a>: Interoperability monitoring service
 ├── <a href="./op-node">op-node</a>: Rollup consensus-layer client
 ├── <a href="./op-preimage">op-preimage</a>: Go bindings for Preimage Oracle
-├── <a href="./op-program">op-program</a>: Fault proof program
 ├── <a href="./op-proposer">op-proposer</a>: L2-Output Submitter, submits proposals to L1
 ├── <a href="./op-service">op-service</a>: Common codebase utilities
 ├── <a href="./op-supervisor">op-supervisor</a>: Service to monitor chains and determine cross-chain message safety
 ├── <a href="./op-sync-tester">op-sync-tester</a>: Sync testing utilities
 ├── <a href="./op-test-sequencer">op-test-sequencer</a>: Test sequencer for development
 ├── <a href="./op-up">op-up</a>: Deployment and management utilities
-├── <a href="./op-validator">op-validator</a>: Tool for validating Optimism chain configurations and deployments
 ├── <a href="./op-wheel">op-wheel</a>: Database utilities
 ├── <a href="./ops">ops</a>: Various operational packages
 ├── <a href="./packages">packages</a>
-│   ├── <a href="./packages/contracts-bedrock">contracts-bedrock</a>: OP Stack smart contracts
+│   └── <a href="./packages/contracts-bedrock">contracts-bedrock</a>: OP Stack smart contracts
+└── <a href="./rust">rust</a>: Rust components — a unified Cargo workspace
+    ├── <a href="./rust/kona">kona</a>: OP Stack state-transition (fault proof) program and rollup node in Rust
+    ├── <a href="./rust/op-reth">op-reth</a>: OP Stack execution client built on reth
+    ├── <a href="./rust/op-reth-test-engine">op-reth-test-engine</a>: Minimal execution-layer engine, e.g. an op-geth replacement in Go action tests (WIP)
+    ├── <a href="./rust/op-revm">op-revm</a>: OP Stack EVM implementation (revm fork)
+    ├── <a href="./rust/op-alloy">op-alloy</a>: OP Stack types and providers for the alloy ecosystem
+    ├── <a href="./rust/alloy-op-evm">alloy-op-evm</a>: OP Stack EVM support for the alloy ecosystem
+    ├── <a href="./rust/alloy-op-hardforks">alloy-op-hardforks</a>: OP Stack hardfork definitions for the alloy ecosystem
+    └── <a href="./rust/lokahi">lokahi</a>: Rust rewrite of op-supernode, the multi-chain consensus-layer host (WIP)
 </pre>
 
 ## Development and Release Process
@@ -122,7 +128,7 @@ For example if geth is at `v1.12.0`, the corresponding op-geth version would be 
 Note that we pad out to three characters for the geth minor version and two characters for the geth patch version.
 Since we cannot left-pad with zeroes, the geth major version is not padded.
 
-See the [Node Software Releases](https://docs.optimism.io/builders/node-operators/releases) page of the documentation for more information about releases for the latest node components.
+See the [GitHub releases](https://github.com/ethereum-optimism/optimism/releases) page for more information about releases for the latest node components.
 
 The full set of components that have releases are:
 
@@ -144,6 +150,33 @@ If you're making a backwards compatible change, please direct your pull request 
 Some exceptions to this rule exist for cases in which we absolutely must deploy some new contract after a tag has already been fully deployed.
 If you're changing or adding a contract and you're unsure about which branch to make a PR into, default to using a feature branch.
 Feature branches are typically used when there are conflicts between 2 projects touching the same code, to avoid conflicts from merging both into `develop`.
+
+## Downloading & Shallow-Cloning the Monorepo
+
+If you want to use the monorepo as a dependency, e.g. in CI, you can greatly speed up the fetching process by either downloading it directly as an archive from Github instead of cloning as a git repository or shallow-cloning it.
+This avoids downloading the full monorepo git history, which is unfortunately a few GBs in size, but which also isn't needed for many use cases, like CI.
+
+To fetch the monorepo at a specific commit/branch/tag `$REF`, download and unpack with
+```
+curl -L https://github.com/ethereum-optimism/optimism/archive/$REF.tar.gz | tar xz
+```
+Note that if you need any of its submodules, you'd need to manually download those too.
+
+If you want a shallow git clone of latest `develop`, you can just do
+```
+git clone --depth 1 --shallow-submodules https://github.com/ethereum-optimism/optimism.git
+```
+which takes only a few seconds on a good internet connection.
+
+If you want to shallow-checkout a specific branch or tag `$REF`, do
+
+```
+git clone --no-checkout --depth 1 --shallow-submodules https://github.com/ethereum-optimism/optimism.git
+cd optimism
+git fetch --depth 1 origin "$REF"
+git checkout "$REF"
+```
+which should also only take a few seconds.
 
 ## License
 

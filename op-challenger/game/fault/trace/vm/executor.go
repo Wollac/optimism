@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
+	gameTypes "github.com/ethereum-optimism/optimism/op-challenger/game/types"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/utils"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
 	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
 	"github.com/ethereum-optimism/optimism/op-node/chaincfg"
 	"github.com/ethereum-optimism/optimism/op-service/jsonutil"
@@ -41,7 +41,7 @@ type Metricer = metrics.TypedVmMetricer
 
 type Config struct {
 	// VM Configuration
-	VmType          types.TraceType
+	VmType          gameTypes.GameType
 	VmBin           string // Path to the vm executable to run when generating trace data
 	SnapshotFreq    uint   // Frequency of snapshots to create when executing (in VM instructions)
 	InfoFreq        uint   // Frequency of progress log messages (in VM instructions)
@@ -62,19 +62,21 @@ type Config struct {
 	DepsetConfigPath  string
 }
 
-func (c *Config) Check() error {
+func (c *Config) Check(requireServer bool) error {
 	if c.VmBin == "" {
 		return ErrMissingBin
 	}
-	if c.Server == "" {
+	if requireServer && c.Server == "" {
 		return ErrMissingServer
 	}
 
 	if _, err := os.Stat(c.VmBin); err != nil {
 		return fmt.Errorf("%w: %w", ErrMissingBin, err)
 	}
-	if _, err := os.Stat(c.Server); err != nil {
-		return fmt.Errorf("%w: %w", ErrMissingServer, err)
+	if requireServer {
+		if _, err := os.Stat(c.Server); err != nil {
+			return fmt.Errorf("%w: %w", ErrMissingServer, err)
+		}
 	}
 
 	if len(c.Networks) == 0 {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	_ "net/http/pprof"
 	"sync"
@@ -74,7 +75,7 @@ type L1Client interface {
 }
 
 type L2Client interface {
-	BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error)
+	PayloadByNumber(ctx context.Context, number uint64) (*eth.ExecutionPayloadEnvelope, error)
 }
 
 type RollupClient interface {
@@ -83,6 +84,7 @@ type RollupClient interface {
 
 // DriverSetup is the collection of input/output interfaces and configuration that the driver operates on.
 type DriverSetup struct {
+	closeApp          context.CancelCauseFunc
 	Log               log.Logger
 	Metr              metrics.Metricer
 	RollupConfig      *rollup.Config
@@ -99,7 +101,6 @@ type DriverSetup struct {
 // batches to L1 for availability.
 type BatchSubmitter struct {
 	DriverSetup
-
 	wg                               *sync.WaitGroup
 	shutdownCtx, killCtx             context.Context
 	cancelShutdownCtx, cancelKillCtx context.CancelFunc
@@ -117,7 +118,7 @@ type BatchSubmitter struct {
 
 	throttleController *throttler.ThrottleController
 
-	publishSignal chan bool // true if we should force a tx to be published now, false if we should check the usual conditions (timeouts)
+	publishSignal chan pubInfo
 }
 
 // NewBatchSubmitter initializes the BatchSubmitter driver from a preconfigured DriverSetup
@@ -173,7 +174,7 @@ func (l *BatchSubmitter) StartBatchSubmitting() error {
 
 	// Channels used to signal between the loops
 	unsafeBytesUpdated := make(chan int64, 1)
-	publishSignal := make(chan bool, 1)
+	publishSignal := make(chan pubInfo, 1)
 	l.publishSignal = publishSignal
 
 	// DA throttling loop should always be started except for testing (indicated by ThrottleThreshold == 0)
@@ -268,13 +269,13 @@ func (l *BatchSubmitter) Flush(ctx context.Context) error {
 	}
 
 	l.Log.Info("Flushing Batch Submitter")
-	trySignal(l.publishSignal, true)
+	l.tryPublishSignal(l.publishSignal, pubInfo{forcePublish: true})
 	return nil
 }
 
 // loadBlocksIntoState loads the blocks between start and end (inclusive).
 // If there is a reorg, it will return an error.
-func (l *BatchSubmitter) loadBlocksIntoState(ctx context.Context, start, end uint64, publishSignal chan bool, unsafeBytesUpdated chan int64) error {
+func (l *BatchSubmitter) loadBlocksIntoState(ctx context.Context, start, end uint64, publishSignal chan pubInfo, unsafeBytesUpdated chan int64) error {
 	if end < start {
 		return fmt.Errorf("start number is > end number %d,%d", start, end)
 	}
@@ -284,10 +285,10 @@ func (l *BatchSubmitter) loadBlocksIntoState(ctx context.Context, start, end uin
 		l.Log.Info("Loading range of multiple blocks into state", "start", start, "end", end)
 	}
 
-	var latestBlock *types.Block
+	var latestPayload *eth.ExecutionPayload
 	// Add all blocks to "state"
 	for i := start; i <= end; i++ {
-		block, err := l.loadBlockIntoState(ctx, i)
+		payload, err := l.loadBlockIntoState(ctx, i)
 		if errors.Is(err, ErrReorg) {
 			l.Log.Warn("Found L2 reorg", "block_number", i)
 			return err
@@ -295,19 +296,19 @@ func (l *BatchSubmitter) loadBlocksIntoState(ctx context.Context, start, end uin
 			l.Log.Warn("Failed to load block into state", "err", err)
 			return err
 		}
-		latestBlock = block
+		latestPayload = payload
 
 		if numBlocksLoaded := (i - start + 1); numBlocksLoaded%100 == 0 {
 			// Every 100 blocks, signal the publishing loop to publish.
 			// This allows the batcher to start publishing sooner in the
 			// case of a large backlog of blocks to load.
 			l.sendToThrottlingLoop(unsafeBytesUpdated)
-			trySignal(publishSignal, false)
+			l.tryPublishSignal(publishSignal, pubInfo{ignoreMaxChannelDuration: i < end})
 		}
 
 	}
 
-	l2ref, err := derive.L2BlockToBlockRef(l.RollupConfig, latestBlock)
+	l2ref, err := derive.PayloadToBlockRef(l.RollupConfig, latestPayload)
 	if err != nil {
 		l.Log.Warn("Invalid L2 block loaded into state", "err", err)
 		return err
@@ -317,9 +318,9 @@ func (l *BatchSubmitter) loadBlocksIntoState(ctx context.Context, start, end uin
 	return nil
 }
 
-// loadBlockIntoState fetches & stores a single block into `state`. It returns the block it loaded.
-func (l *BatchSubmitter) loadBlockIntoState(ctx context.Context, blockNumber uint64) (*types.Block, error) {
-	l2Client, err := l.EndpointProvider.EthClient(ctx)
+// loadBlockIntoState fetches & stores a single block into `state`. It returns the payload it loaded.
+func (l *BatchSubmitter) loadBlockIntoState(ctx context.Context, blockNumber uint64) (*eth.ExecutionPayload, error) {
+	l2Client, err := l.EndpointProvider.PayloadSource(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting L2 client: %w", err)
 	}
@@ -327,22 +328,20 @@ func (l *BatchSubmitter) loadBlockIntoState(ctx context.Context, blockNumber uin
 	cCtx, cancel := context.WithTimeout(ctx, l.Config.NetworkTimeout)
 	defer cancel()
 
-	block, err := l2Client.BlockByNumber(cCtx, new(big.Int).SetUint64(blockNumber))
-
+	envelope, err := l2Client.PayloadByNumber(cCtx, blockNumber)
 	if err != nil {
 		return nil, fmt.Errorf("getting L2 block: %w", err)
 	}
-
-	l.Log.Debug("Loaded L2 block", "size", block.Size())
+	payload := envelope.ExecutionPayload
 
 	l.channelMgrMutex.Lock()
 	defer l.channelMgrMutex.Unlock()
-	if err := l.channelMgr.AddL2Block(block); err != nil {
+	if err := l.channelMgr.AddL2Block(payload); err != nil {
 		return nil, fmt.Errorf("adding L2 block to state: %w", err)
 	}
 
-	l.Log.Info("Added L2 block to local state", "block", eth.ToBlockID(block), "tx_count", len(block.Transactions()), "time", block.Time())
-	return block, nil
+	l.Log.Info("Added L2 block to local state", "block", payload.ID(), "tx_count", len(payload.Transactions), "time", payload.Timestamp)
+	return payload, nil
 }
 
 func (l *BatchSubmitter) getSyncStatus(ctx context.Context) (*eth.SyncStatus, error) {
@@ -424,25 +423,25 @@ func (l *BatchSubmitter) unsafeDABytes() int64 {
 }
 
 // sendToThrottlingLoop sends the current unsafe bytes to the throttling loop.
-// It is not blocking, no signal will be sent if the channel is full.
+// It is not blocking, no signal will be sent if the channel is full or if the throttling loop is not running.
 func (l *BatchSubmitter) sendToThrottlingLoop(unsafeBytesUpdated chan int64) {
-	if l.Config.ThrottleParams.LowerThreshold == 0 {
-		return
-	}
-
+	unsafeDABytes := l.unsafeDABytes()
+	l.Metr.RecordUnsafeDABytes(unsafeDABytes)
 	// notify the throttling loop it may be time to initiate throttling without blocking
 	select {
-	case unsafeBytesUpdated <- l.unsafeDABytes():
+	case unsafeBytesUpdated <- unsafeDABytes:
 	default:
+		// drop the update if there is no ready reader for the channel
 	}
 }
 
-// trySignal tries to send an empty struct on the provided channel.
+// trySignal tries to send the provided value on the provided channel.
 // It is not blocking, no signal will be sent if the channel is full.
-func trySignal(c chan bool, value bool) {
+func (l *BatchSubmitter) tryPublishSignal(c chan pubInfo, value pubInfo) {
 	select {
 	case c <- value:
 	default:
+		l.Log.Warn("publishSignal channel is full, skipping signal")
 	}
 }
 
@@ -487,7 +486,7 @@ func (l *BatchSubmitter) syncAndPrune(syncStatus *eth.SyncStatus) *inclusiveBloc
 // -  waits for a signal that blocks have been loaded
 // -  drives the creation of channels and frames
 // -  sends transactions to the DA layer
-func (l *BatchSubmitter) publishingLoop(ctx context.Context, wg *sync.WaitGroup, receiptsCh chan txmgr.TxReceipt[txRef], publishSignal chan bool) {
+func (l *BatchSubmitter) publishingLoop(ctx context.Context, wg *sync.WaitGroup, receiptsCh chan txmgr.TxReceipt[txRef], publishSignal chan pubInfo) {
 	defer close(receiptsCh)
 	defer wg.Done()
 
@@ -499,9 +498,9 @@ func (l *BatchSubmitter) publishingLoop(ctx context.Context, wg *sync.WaitGroup,
 	}
 	txQueue := txmgr.NewQueue[txRef](ctx, l.Txmgr, l.Config.MaxPendingTransactions)
 
-	for forcePublish := range publishSignal {
-		l.Log.Debug("publishing loop received signal", "force_publish", forcePublish)
-		l.publishStateToL1(ctx, txQueue, receiptsCh, daGroup, forcePublish)
+	for pi := range l.publishSignal {
+		l.Log.Debug("publishing loop received signal", "force_publish", pi.forcePublish)
+		l.publishStateToL1(ctx, txQueue, receiptsCh, daGroup, pi)
 	}
 
 	// First wait for all DA requests to finish to prevent new transactions being queued
@@ -524,7 +523,7 @@ func (l *BatchSubmitter) publishingLoop(ctx context.Context, wg *sync.WaitGroup,
 // -  polls the sequencer,
 // -  prunes the channel manager state (i.e. safe blocks)
 // -  loads unsafe blocks from the sequencer
-func (l *BatchSubmitter) blockLoadingLoop(ctx context.Context, wg *sync.WaitGroup, unsafeBytesUpdated chan int64, publishSignal chan bool) {
+func (l *BatchSubmitter) blockLoadingLoop(ctx context.Context, wg *sync.WaitGroup, unsafeBytesUpdated chan int64, publishSignal chan pubInfo) {
 	ticker := time.NewTicker(l.Config.PollInterval)
 	defer ticker.Stop()
 	defer close(unsafeBytesUpdated)
@@ -556,7 +555,7 @@ func (l *BatchSubmitter) blockLoadingLoop(ctx context.Context, wg *sync.WaitGrou
 					l.sendToThrottlingLoop(unsafeBytesUpdated) // we have increased the unsafe data. Signal the throttling loop to check if it should throttle.
 				}
 			}
-			trySignal(publishSignal, false) // always signal the write loop to ensure we periodically publish even if we aren't loading blocks
+			l.tryPublishSignal(publishSignal, pubInfo{}) // always signal the publishing loop to ensure we periodically publish even if we aren't loading blocks
 		case <-ctx.Done():
 			l.Log.Info("blockLoadingLoop returning")
 			return
@@ -583,6 +582,10 @@ func (l *BatchSubmitter) receiptsLoop(wg *sync.WaitGroup, receiptsCh chan txmgr.
 		l.handleReceipt(r)
 	}
 	l.Log.Info("receiptsLoop returning")
+}
+
+func ErrSetMaxDASizeRPCMethodUnavailable(endpoint string, err error) error {
+	return fmt.Errorf("%s unavailable at %s,  either enable it or disable throttling: %w", SetMaxDASizeMethod, endpoint, err)
 }
 
 // singleEndpointThrottler handles throttling for a specific endpoint
@@ -623,20 +626,13 @@ func (l *BatchSubmitter) singleEndpointThrottler(wg *sync.WaitGroup, throttleSig
 			return
 		}
 
-		var rpcErr rpc.Error
-		if errors.As(err, &rpcErr) && eth.ErrorCode(rpcErr.ErrorCode()).IsGenericRPCError() {
-			l.Log.Error("SetMaxDASize RPC method unavailable on endpoint, shutting down. Either enable it or disable throttling.",
-				"endpoint", endpoint, "err", err)
-
-			// We have a strict requirement that all endpoints must have the SetMaxDASize endpoint, and shut down if this RPC method is not available
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			// Call StopBatchSubmitting in another goroutine to avoid deadlock.
-			go func() {
-				_ = l.StopBatchSubmitting(ctx)
-			}()
+		if isCriticalThrottlingRPCError(err) {
+			// We have a strict requirement that all endpoints must have the SetMaxDASize endpoint,
+			// and shut down if this RPC method is not available or returns another application-level error.
+			l.shutdownOnCriticalError(ErrSetMaxDASizeRPCMethodUnavailable(endpoint, err))
 			return
 		} else if err != nil {
+			// Transport-level errors are retried.
 			l.Log.Warn("SetMaxDASize RPC failed for endpoint, retrying.", "endpoint", endpoint, "err", err)
 			retryTimer.Reset(retryInterval)
 			return
@@ -671,6 +667,21 @@ func (l *BatchSubmitter) singleEndpointThrottler(wg *sync.WaitGroup, throttleSig
 	}
 }
 
+func isCriticalThrottlingRPCError(err error) bool {
+	var rpcErr rpc.Error
+	return errors.As(err, &rpcErr) && eth.ErrorCode(rpcErr.ErrorCode()).IsGenericRPCError()
+}
+
+func (l *BatchSubmitter) shutdownOnCriticalError(err error) {
+	l.Log.Error("Critical error detected, attempting batcher shut down", "err", err)
+	if l.closeApp != nil {
+		// Call closeApp to trigger process to exit (gracefully) if l.closeApp is set.
+		l.closeApp(err)
+	} else {
+		l.Log.Warn("No closeApp function set, cannot shut down batcher on critical error", "err", err)
+	}
+}
+
 // throttlingLoop acts as a distributor that spawns individual throttling loops for each endpoint
 // and fans out the unsafe bytes updates to each endpoint
 func (l *BatchSubmitter) throttlingLoop(wg *sync.WaitGroup, unsafeBytesUpdated chan int64) {
@@ -691,7 +702,6 @@ func (l *BatchSubmitter) throttlingLoop(wg *sync.WaitGroup, unsafeBytesUpdated c
 	}
 
 	for unsafeBytes := range unsafeBytesUpdated {
-		l.Metr.RecordUnsafeDABytes(unsafeBytes)
 		newParams := l.throttleController.Update(uint64(unsafeBytes))
 		controllerType := l.throttleController.GetType()
 
@@ -749,7 +759,7 @@ func (l *BatchSubmitter) waitNodeSync() error {
 	cCtx, cancel := context.WithTimeout(ctx, l.Config.NetworkTimeout)
 	defer cancel()
 
-	l1Tip, _, err := l.l1Tip(cCtx)
+	l1Tip, err := l.l1Tip(cCtx)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve l1 tip: %w", err)
 	}
@@ -771,7 +781,7 @@ func (l *BatchSubmitter) waitNodeSync() error {
 
 // publishStateToL1 queues up all pending TxData to be published to the L1, returning when there is no more data to
 // queue for publishing or if there was an error queuing the data.
-func (l *BatchSubmitter) publishStateToL1(ctx context.Context, queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef], daGroup *errgroup.Group, forcePublish bool) {
+func (l *BatchSubmitter) publishStateToL1(ctx context.Context, queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef], daGroup *errgroup.Group, pi pubInfo) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -788,7 +798,7 @@ func (l *BatchSubmitter) publishStateToL1(ctx context.Context, queue *txmgr.Queu
 			return
 		}
 
-		err := l.publishTxToL1(ctx, queue, receiptsCh, daGroup, forcePublish)
+		err := l.publishTxToL1(ctx, queue, receiptsCh, daGroup, pi)
 		if err != nil {
 			if err != io.EOF {
 				l.Log.Error("Error publishing tx to l1", "err", err)
@@ -842,9 +852,9 @@ func (l *BatchSubmitter) clearState(ctx context.Context) {
 }
 
 // publishTxToL1 submits a single state tx to the L1
-func (l *BatchSubmitter) publishTxToL1(ctx context.Context, queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef], daGroup *errgroup.Group, forcePublish bool) error {
+func (l *BatchSubmitter) publishTxToL1(ctx context.Context, queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef], daGroup *errgroup.Group, pi pubInfo) error {
 	// send all available transactions
-	l1tip, isPectra, err := l.l1Tip(ctx)
+	l1tip, err := l.l1Tip(ctx)
 	if err != nil {
 		l.Log.Error("Failed to query L1 tip", "err", err)
 		return err
@@ -855,7 +865,7 @@ func (l *BatchSubmitter) publishTxToL1(ctx context.Context, queue *txmgr.Queue[t
 	// Collect next transaction data. This pulls data out of the channel, so we need to make sure
 	// to put it back if ever da or txmgr requests fail, by calling l.recordFailedDARequest/recordFailedTx.
 	l.channelMgrMutex.Lock()
-	txdata, err := l.channelMgr.TxData(l1tip.ID(), isPectra, params.IsThrottling(), forcePublish)
+	txdata, err := l.channelMgr.TxData(l1tip.ID(), params.IsThrottling(), pi)
 	l.channelMgrMutex.Unlock()
 
 	if err == io.EOF {
@@ -996,15 +1006,47 @@ type TxSender[T any] interface {
 // sendTx uses the txmgr queue to send the given transaction candidate after setting its
 // gaslimit. It will block if the txmgr queue has reached its MaxPendingTransactions limit.
 func (l *BatchSubmitter) sendTx(txdata txData, isCancel bool, candidate *txmgr.TxCandidate, queue TxSender[txRef], receiptsCh chan txmgr.TxReceipt[txRef]) {
-	floorDataGas, err := core.FloorDataGas(candidate.TxData)
+	gasLimit, err := maxFloorDataGas(candidate.TxData)
 	if err != nil {
-		// We log instead of return an error here because the txmgr will do its own gas estimation.
-		l.Log.Warn("Failed to calculate floor data gas", "err", err)
+		// We log instead of returning an error here because the txmgr will do its own gas estimation.
+		l.Log.Warn("Failed to calculate batch transaction gas limit", "err", err)
 	} else {
-		candidate.GasLimit = floorDataGas
+		candidate.GasLimit = gasLimit
 	}
 
 	queue.Send(txRef{id: txdata.ID(), isCancel: isCancel, isBlob: txdata.asBlob}, *candidate, receiptsCh)
+}
+
+// maxFloorDataGas returns a gas limit valid under both the pre-Amsterdam EIP-7623 rules and
+// Amsterdam's EIP-2780/EIP-7976 rules. The pre-Amsterdam floor also exceeds Amsterdam's regular
+// intrinsic gas whenever it exceeds the Amsterdam floor, so the larger floor is sufficient.
+func maxFloorDataGas(data []byte) (uint64, error) {
+	preAmsterdam, err := core.FloorDataGas(data)
+	if err != nil {
+		return 0, err
+	}
+	amsterdam, err := amsterdamFloorDataGas(data)
+	if err != nil {
+		return 0, err
+	}
+	return max(preAmsterdam, amsterdam), nil
+}
+
+// NOTE: we can probably replace this function with core.FloorDataGas once our geth dependency
+// includes the Amsterdam calculation.
+func amsterdamFloorDataGas(data []byte) (uint64, error) {
+	const (
+		amsterdamTxBaseGas               = uint64(12_000 + 3_000) // EIP-2780: TX_BASE_COST + COLD_ACCOUNT_ACCESS
+		amsterdamCalldataFloorGasPerByte = uint64(64)             // EIP-7976: 4 tokens per byte at 16 gas per token
+	)
+	return addGas(amsterdamTxBaseGas, uint64(len(data)), amsterdamCalldataFloorGasPerByte)
+}
+
+func addGas(base, count, cost uint64) (uint64, error) {
+	if count > (math.MaxUint64-base)/cost {
+		return 0, core.ErrGasUintOverflow
+	}
+	return base + count*cost, nil
 }
 
 func (l *BatchSubmitter) blobTxCandidate(data txData) (*txmgr.TxCandidate, error) {
@@ -1067,16 +1109,14 @@ func (l *BatchSubmitter) recordConfirmedTx(id txID, receipt *types.Receipt) {
 
 // l1Tip gets the current L1 tip as a L1BlockRef. The passed context is assumed
 // to be a lifetime context, so it is internally wrapped with a network timeout.
-// It also returns a boolean indicating if the tip is from a Pectra chain.
-func (l *BatchSubmitter) l1Tip(ctx context.Context) (eth.L1BlockRef, bool, error) {
+func (l *BatchSubmitter) l1Tip(ctx context.Context) (eth.L1BlockRef, error) {
 	tctx, cancel := context.WithTimeout(ctx, l.Config.NetworkTimeout)
 	defer cancel()
 	head, err := l.L1Client.HeaderByNumber(tctx, nil)
 	if err != nil {
-		return eth.L1BlockRef{}, false, fmt.Errorf("getting latest L1 block: %w", err)
+		return eth.L1BlockRef{}, fmt.Errorf("getting latest L1 block: %w", err)
 	}
-	isPectra := head.RequestsHash != nil // See https://eips.ethereum.org/EIPS/eip-7685
-	return eth.InfoToL1BlockRef(eth.HeaderBlockInfo(head)), isPectra, nil
+	return eth.InfoToL1BlockRef(eth.HeaderBlockInfo(head)), nil
 }
 
 func (l *BatchSubmitter) checkTxpool(queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef]) bool {

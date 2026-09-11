@@ -13,9 +13,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/sources/batching/rpcblock"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/stretchr/testify/require"
 )
@@ -23,35 +21,38 @@ import (
 func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Parallel()
 
-	t.Run("ErrorWhenNoSupervisorClient", func(t *testing.T) {
+	t.Run("ErrorWhenNoSuperRootProvider", func(t *testing.T) {
 		validator, _, _ := setupSuperValidatorTest(t)
 		validator.clients = nil // Set to nil to test the error case
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
-		require.ErrorIs(t, err, ErrSupervisorRpcRequired)
+		require.ErrorIs(t, err, ErrSuperRootRpcRequired)
+		require.ErrorContains(t, err, "super root RPC required")
 	})
 
-	t.Run("SkipOutputRootGameTypes", func(t *testing.T) {
-		gameTypes := []uint32{0, 1, 2, 3, 6, 254, 255, 1337}
+	t.Run("SkipUnsupportedGameTypes", func(t *testing.T) {
+		gameTypes := []uint32{0, 1, 2, 3, 4, 6, 7, 8, 10, 11, 254, 255, 1337, 49812}
 		for _, gameType := range gameTypes {
 			gameType := gameType
 			t.Run(fmt.Sprintf("GameType_%d", gameType), func(t *testing.T) {
 				validator, _, metrics := setupSuperValidatorTest(t)
-				validator.clients = nil // Should not error even though there's no supervisor client
-				game := &types.EnrichedGameData{
+				validator.clients = nil // Should not error even though there's no super root RPC client
+				game := &types.CommonGameData{
 					GameMetadata: challengerTypes.GameMetadata{
 						GameType: gameType,
 					},
-					L1HeadNum:        200,
-					L2SequenceNumber: 0,
-					RootClaim:        mockRootClaim,
+					L1HeadNum:          200,
+					L2SequenceNumber:   0,
+					RootClaim:          mockRootClaim,
+					NodeEndpointErrors: make(map[string]bool),
 				}
 				err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 				require.NoError(t, err)
@@ -60,19 +61,23 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 		}
 	})
 
-	t.Run("FetchAllNonOutputRootGameTypes", func(t *testing.T) {
-		gameTypes := []uint32{4, 5, 7, 8, 10, 49812} // Treat unknown game types as using super roots
+	t.Run("FetchSupportedSuperRootGameTypes", func(t *testing.T) {
+		gameTypes := []uint32{
+			uint32(challengerTypes.SuperPermissionedGameType),
+			uint32(challengerTypes.SuperCannonKonaGameType),
+		}
 		for _, gameType := range gameTypes {
 			gameType := gameType
 			t.Run(fmt.Sprintf("GameType_%d", gameType), func(t *testing.T) {
 				validator, _, metrics := setupSuperValidatorTest(t)
-				game := &types.EnrichedGameData{
+				game := &types.CommonGameData{
 					GameMetadata: challengerTypes.GameMetadata{
 						GameType: gameType,
 					},
-					L1HeadNum:        200,
-					L2SequenceNumber: 0,
-					RootClaim:        mockRootClaim,
+					L1HeadNum:          200,
+					L2SequenceNumber:   0,
+					RootClaim:          mockRootClaim,
+					NodeEndpointErrors: make(map[string]bool),
 				}
 				err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 				require.NoError(t, err)
@@ -84,16 +89,18 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Run("OutputFetchFails", func(t *testing.T) {
 		validator, rollup, metrics := setupSuperValidatorTest(t)
 		rollup.outputErr = errors.New("boom")
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
-		require.ErrorIs(t, err, ErrAllSupervisorNodesUnavailable)
+		require.ErrorIs(t, err, ErrAllSuperRootRpcsUnavailable)
+		require.ErrorContains(t, err, "all super root RPC sources returned errors")
 		require.Equal(t, common.Hash{}, game.ExpectedRootClaim)
 		require.False(t, game.AgreeWithClaim)
 		require.Zero(t, metrics.fetchTime)
@@ -101,13 +108,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 
 	t.Run("OutputMismatch_Safe", func(t *testing.T) {
 		validator, _, metrics := setupSuperValidatorTest(t)
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 0,
-			RootClaim:        common.Hash{},
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          common.Hash{},
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -119,13 +127,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Run("OutputMatches_Safe_DerivedFromGameHead", func(t *testing.T) {
 		validator, client, metrics := setupSuperValidatorTest(t)
 		client.derivedFromL1BlockNum = 200
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -137,13 +146,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Run("OutputMatches_Safe_DerivedFromBeforeGameHead", func(t *testing.T) {
 		validator, client, metrics := setupSuperValidatorTest(t)
 		client.derivedFromL1BlockNum = 199
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -155,13 +165,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Run("OutputMismatch_NotSafe", func(t *testing.T) {
 		validator, client, metrics := setupSuperValidatorTest(t)
 		client.derivedFromL1BlockNum = 101
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 0,
-			RootClaim:        common.Hash{},
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          common.Hash{},
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -173,13 +184,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	t.Run("OutputMatches_NotSafe", func(t *testing.T) {
 		validator, client, metrics := setupSuperValidatorTest(t)
 		client.derivedFromL1BlockNum = 201
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 100,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   100,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -190,15 +202,15 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 
 	t.Run("OutputNotFound", func(t *testing.T) {
 		validator, client, metrics := setupSuperValidatorTest(t)
-		// The supervisor client automatically translates RPC errors back to ethereum.NotFound for us
-		client.outputErr = ethereum.NotFound
-		game := &types.EnrichedGameData{
+		client.notFound = true
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 42984924,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          100,
+			L2SequenceNumber:   42984924,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -207,39 +219,41 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 		require.Zero(t, metrics.fetchTime)
 	})
 
-	t.Run("AllSupervisorNodesReturnError", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+	t.Run("AllSuperRootRpcsReturnError", func(t *testing.T) {
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 		for _, client := range clients {
 			client.outputErr = errors.New("boom")
 		}
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.Error(t, err)
-		require.ErrorIs(t, err, ErrAllSupervisorNodesUnavailable)
+		require.ErrorIs(t, err, ErrAllSuperRootRpcsUnavailable)
 		require.Equal(t, common.Hash{}, game.ExpectedRootClaim)
 		require.False(t, game.AgreeWithClaim)
 		require.Zero(t, metrics.fetchTime)
 	})
 
-	t.Run("AllSupervisorNodesReturnNotFound", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+	t.Run("AllSuperRootRpcsReturnNotFound", func(t *testing.T) {
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 		for _, client := range clients {
-			client.outputErr = ethereum.NotFound
+			client.notFound = true
 		}
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        100,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          100,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -248,18 +262,19 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 		require.Zero(t, metrics.fetchTime)
 	})
 
-	t.Run("SomeSupervisorNodesOutOfSync", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
-		clients[0].outputErr = ethereum.NotFound
+	t.Run("SomeSuperRootRpcsOutOfSync", func(t *testing.T) {
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
+		clients[0].notFound = true
 		clients[1].outputErr = nil
 		clients[2].outputErr = nil
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -268,19 +283,20 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 		require.NotZero(t, metrics.fetchTime)
 	})
 
-	t.Run("SupervisorNodesDiverged", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+	t.Run("SuperRootRpcsDiverged", func(t *testing.T) {
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 		divergedRoot := common.HexToHash("0x5678")
 		clients[0].superRoot = mockRootClaim
 		clients[1].superRoot = divergedRoot
 		clients[2].superRoot = divergedRoot
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -289,18 +305,19 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 		require.NotZero(t, metrics.fetchTime)
 	})
 
-	t.Run("AllSupervisorNodesAgree", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+	t.Run("AllSuperRootRpcsAgree", func(t *testing.T) {
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 		clients[0].derivedFromL1BlockNum = 200
 		clients[1].derivedFromL1BlockNum = 199
 		clients[2].derivedFromL1BlockNum = 201
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 0,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -310,20 +327,21 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	})
 
 	t.Run("MixedResponses_FoundNodesMatchClaimAndSafe", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 4)
-		clients[0].outputErr = ethereum.NotFound
-		clients[1].outputErr = ethereum.NotFound
+		validator, clients, metrics := setupMultiSuperRootTest(t, 4)
+		clients[0].notFound = true
+		clients[1].notFound = true
 		clients[2].superRoot = mockRootClaim
 		clients[2].derivedFromL1BlockNum = 100 // Safe because L1HeadNum is 200
 		clients[3].superRoot = mockRootClaim
 		clients[3].derivedFromL1BlockNum = 150 // Safe because L1HeadNum is 200
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 50,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -333,20 +351,21 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	})
 
 	t.Run("MixedResponses_FoundNodesDontMatchClaim", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 		differentRoot := common.HexToHash("0x9999")
-		clients[0].outputErr = ethereum.NotFound
+		clients[0].notFound = true
 		clients[1].superRoot = differentRoot
 		clients[1].derivedFromL1BlockNum = 100
 		clients[2].superRoot = differentRoot
 		clients[2].derivedFromL1BlockNum = 150
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 50,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -356,20 +375,21 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	})
 
 	t.Run("AllNodesAgree_SuperRootMatchesClaim_NoneReportSafe", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 
 		for _, client := range clients {
 			client.superRoot = mockRootClaim
 			client.derivedFromL1BlockNum = 250 // Not safe because L1HeadNum is 200
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 50,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -379,7 +399,7 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	})
 
 	t.Run("AllNodesAgree_SuperRootDifferentFromClaim", func(t *testing.T) {
-		validator, clients, metrics := setupMultiSupervisorTest(t, 3)
+		validator, clients, metrics := setupMultiSuperRootTest(t, 3)
 
 		differentRoot := common.HexToHash("0xdifferent")
 		for _, client := range clients {
@@ -387,13 +407,14 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 			client.derivedFromL1BlockNum = 100 // Safe because L1HeadNum is 200
 		}
 
-		game := &types.EnrichedGameData{
+		game := &types.CommonGameData{
 			GameMetadata: challengerTypes.GameMetadata{
-				GameType: 999,
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
 			},
-			L1HeadNum:        200,
-			L2SequenceNumber: 50,
-			RootClaim:        mockRootClaim,
+			L1HeadNum:          200,
+			L2SequenceNumber:   50,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
 		}
 		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
 		require.NoError(t, err)
@@ -403,46 +424,219 @@ func TestDetector_CheckSuperRootAgreement(t *testing.T) {
 	})
 }
 
-func setupSuperValidatorTest(t *testing.T) (*SuperAgreementEnricher, *stubSupervisorClient, *stubOutputMetrics) {
+func setupSuperValidatorTest(t *testing.T) (*SuperAgreementEnricher, *stubSuperRootProvider, *stubOutputMetrics) {
 	logger := testlog.Logger(t, log.LvlInfo)
-	client := &stubSupervisorClient{derivedFromL1BlockNum: 0, superRoot: mockRootClaim}
+	client := &stubSuperRootProvider{derivedFromL1BlockNum: 0, superRoot: mockRootClaim}
 	metrics := &stubOutputMetrics{}
 	validator := NewSuperAgreementEnricher(logger, metrics, []SuperRootProvider{client}, clock.NewDeterministicClock(time.Unix(9824924, 499)))
 	return validator, client, metrics
 }
 
-func setupMultiSupervisorTest(t *testing.T, numNodes int) (*SuperAgreementEnricher, []*stubSupervisorClient, *stubOutputMetrics) {
+func setupMultiSuperRootTest(t *testing.T, numNodes int) (*SuperAgreementEnricher, []*stubSuperRootProvider, *stubOutputMetrics) {
 	logger := testlog.Logger(t, log.LvlInfo)
-	clients := make([]*stubSupervisorClient, numNodes)
-	supervisorClients := make([]SuperRootProvider, numNodes)
+	clients := make([]*stubSuperRootProvider, numNodes)
+	providers := make([]SuperRootProvider, numNodes)
 	for i := range clients {
-		clients[i] = &stubSupervisorClient{
+		clients[i] = &stubSuperRootProvider{
 			derivedFromL1BlockNum: 0,
 			superRoot:             mockRootClaim,
 		}
-		supervisorClients[i] = clients[i]
+		providers[i] = clients[i]
 	}
 	metrics := &stubOutputMetrics{}
-	validator := NewSuperAgreementEnricher(logger, metrics, supervisorClients, clock.NewDeterministicClock(time.Unix(9824924, 499)))
+	validator := NewSuperAgreementEnricher(logger, metrics, providers, clock.NewDeterministicClock(time.Unix(9824924, 499)))
 	return validator, clients, metrics
 }
 
-type stubSupervisorClient struct {
+type stubSuperRootProvider struct {
 	requestedTimestamp    uint64
 	outputErr             error
+	notFound              bool
 	derivedFromL1BlockNum uint64
 	superRoot             common.Hash
 }
 
-func (s *stubSupervisorClient) SuperRootAtTimestamp(_ context.Context, timestamp hexutil.Uint64) (eth.SuperRootResponse, error) {
+func (s *stubSuperRootProvider) SuperRootAtTimestamp(_ context.Context, timestamp uint64) (eth.SuperRootAtTimestampResponse, error) {
 	s.requestedTimestamp = uint64(timestamp)
 	if s.outputErr != nil {
-		return eth.SuperRootResponse{}, s.outputErr
+		return eth.SuperRootAtTimestampResponse{}, s.outputErr
 	}
-	return eth.SuperRootResponse{
-		CrossSafeDerivedFrom: eth.BlockID{Number: s.derivedFromL1BlockNum},
-		Timestamp:            uint64(timestamp),
-		SuperRoot:            eth.Bytes32(s.superRoot),
-		Version:              eth.SuperRootVersionV1,
+	if s.notFound {
+		return eth.SuperRootAtTimestampResponse{}, nil
+	}
+	return eth.SuperRootAtTimestampResponse{
+		Data: &eth.SuperRootResponseData{
+			VerifiedRequiredL1: eth.BlockID{Number: s.derivedFromL1BlockNum},
+			Super:              eth.NewSuperV1(timestamp),
+			SuperRoot:          eth.Bytes32(s.superRoot),
+		},
 	}, nil
+}
+
+// TestSuperRootEndpointTracking verifies that all endpoint tracking fields are properly populated
+func TestSuperRootEndpointTracking(t *testing.T) {
+	t.Run("TrackErrorsCorrectly", func(t *testing.T) {
+		validator, clients, _ := setupMultiSuperRootTest(t, 3)
+		clients[0].outputErr = errors.New("error1")
+		clients[1].outputErr = errors.New("error2")
+		clients[2].superRoot = mockRootClaim
+		clients[2].derivedFromL1BlockNum = 100
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+
+		// Verify error tracking
+		require.Equal(t, 3, game.NodeEndpointTotalCount, "Should track total endpoints")
+		require.Equal(t, 2, game.NodeEndpointErrorCount, "Should track 2 errors")
+		require.Equal(t, 2, len(game.NodeEndpointErrors), "Should track 2 unique endpoint errors")
+		require.True(t, game.NodeEndpointErrors["client-0"], "Should track client-0 error")
+		require.True(t, game.NodeEndpointErrors["client-1"], "Should track client-1 error")
+	})
+
+	t.Run("TrackNotFoundCount", func(t *testing.T) {
+		validator, clients, _ := setupMultiSuperRootTest(t, 3)
+		clients[0].notFound = true
+		clients[1].notFound = true
+		clients[2].superRoot = mockRootClaim
+		clients[2].derivedFromL1BlockNum = 100
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+
+		require.Equal(t, 3, game.NodeEndpointTotalCount)
+		require.Equal(t, 2, game.NodeEndpointNotFoundCount, "Should track 2 not found responses")
+		require.Equal(t, 0, game.NodeEndpointErrorCount, "Should have no errors")
+	})
+
+	t.Run("TrackSafeUnsafeCounts", func(t *testing.T) {
+		validator, clients, _ := setupMultiSuperRootTest(t, 4)
+		// Two clients report safe (derivedFromL1BlockNum <= game.L1HeadNum)
+		clients[0].superRoot = mockRootClaim
+		clients[0].derivedFromL1BlockNum = 100 // Safe
+		clients[1].superRoot = mockRootClaim
+		clients[1].derivedFromL1BlockNum = 200 // Safe
+		// Two clients report unsafe (derivedFromL1BlockNum > game.L1HeadNum)
+		clients[2].superRoot = mockRootClaim
+		clients[2].derivedFromL1BlockNum = 201 // Unsafe
+		clients[3].superRoot = mockRootClaim
+		clients[3].derivedFromL1BlockNum = 300 // Unsafe
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		// This should result in disagreement due to mixed safety
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+
+		require.Equal(t, 4, game.NodeEndpointTotalCount)
+		require.Equal(t, 2, game.NodeEndpointSafeCount, "Should track 2 safe assessments")
+		require.Equal(t, 2, game.NodeEndpointUnsafeCount, "Should track 2 unsafe assessments")
+		require.True(t, game.HasMixedSafety(), "Should detect mixed safety")
+	})
+
+	t.Run("TrackDivergentSuperRoots", func(t *testing.T) {
+		validator, clients, _ := setupMultiSuperRootTest(t, 3)
+		divergedRoot := common.HexToHash("0xdivergent")
+		clients[0].superRoot = mockRootClaim
+		clients[0].derivedFromL1BlockNum = 100
+		clients[1].superRoot = divergedRoot
+		clients[1].derivedFromL1BlockNum = 100
+		clients[2].superRoot = divergedRoot
+		clients[2].derivedFromL1BlockNum = 100
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+
+		require.True(t, game.NodeEndpointDifferentRoots, "Should flag divergent super roots")
+		require.False(t, game.AgreeWithClaim, "Should disagree when super roots diverge")
+	})
+
+	t.Run("TrackMixedAvailability", func(t *testing.T) {
+		validator, clients, _ := setupMultiSuperRootTest(t, 3)
+		clients[0].notFound = true
+		clients[1].superRoot = mockRootClaim
+		clients[1].derivedFromL1BlockNum = 100
+		clients[2].superRoot = mockRootClaim
+		clients[2].derivedFromL1BlockNum = 100
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.NoError(t, err)
+
+		require.Equal(t, 3, game.NodeEndpointTotalCount)
+		require.Equal(t, 1, game.NodeEndpointNotFoundCount)
+		require.True(t, game.HasMixedAvailability(), "Should detect mixed availability")
+	})
+
+	t.Run("AllFieldsZeroWhenNoEndpoints", func(t *testing.T) {
+		logger := testlog.Logger(t, log.LvlInfo)
+		validator := NewSuperAgreementEnricher(logger, &stubOutputMetrics{}, []SuperRootProvider{}, clock.NewDeterministicClock(time.Unix(9824924, 499)))
+
+		game := &types.CommonGameData{
+			GameMetadata: challengerTypes.GameMetadata{
+				GameType: uint32(challengerTypes.SuperPermissionedGameType),
+			},
+			L1HeadNum:          200,
+			L2SequenceNumber:   0,
+			RootClaim:          mockRootClaim,
+			NodeEndpointErrors: make(map[string]bool),
+		}
+
+		err := validator.Enrich(context.Background(), rpcblock.Latest, nil, game)
+		require.ErrorIs(t, err, ErrSuperRootRpcRequired)
+
+		// Verify all counts remain zero when no endpoints
+		require.Equal(t, 0, game.NodeEndpointTotalCount)
+		require.Equal(t, 0, game.NodeEndpointErrorCount)
+		require.Equal(t, 0, game.NodeEndpointNotFoundCount)
+		require.Equal(t, 0, game.NodeEndpointSafeCount)
+		require.Equal(t, 0, game.NodeEndpointUnsafeCount)
+		require.False(t, game.NodeEndpointDifferentRoots)
+	})
 }

@@ -2,7 +2,9 @@
 pragma solidity 0.8.15;
 
 // Testing
-import { Test, Vm, console2 as console } from "forge-std/Test.sol";
+import { Test } from "test/setup/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
+import { console2 as console } from "forge-std/console2.sol";
 
 // Scripts
 import { DeployUtils } from "scripts/libraries/DeployUtils.sol";
@@ -1350,7 +1352,7 @@ contract PreimageOracle_SqueezeLPP_Test is PreimageOracle_TestInit {
     }
 
     /// @notice Tests that a proposal cannot be finalized until it has passed the challenge period.
-    function test_squeezeLPP_incompleteAbsorbtion_reverts() public {
+    function test_squeezeLPP_incompleteAbsorption_reverts() public {
         // Allocate the preimage data.
         bytes memory data = new bytes(136);
         for (uint256 i; i < data.length; i++) {

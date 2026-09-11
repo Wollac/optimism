@@ -3,7 +3,7 @@ pragma solidity ^0.8.0;
 
 import { IResourceMetering } from "interfaces/L1/IResourceMetering.sol";
 import { ISuperchainConfig } from "interfaces/L1/ISuperchainConfig.sol";
-import { IProxyAdminOwnedBase } from "interfaces/L1/IProxyAdminOwnedBase.sol";
+import { IProxyAdminOwnedBase } from "interfaces/universal/IProxyAdminOwnedBase.sol";
 
 interface ISystemConfig is IProxyAdminOwnedBase {
     enum UpdateType {
@@ -24,6 +24,7 @@ interface ISystemConfig is IProxyAdminOwnedBase {
         address optimismPortal;
         address optimismMintableERC20Factory;
         address delayedWETH;
+        address opcm;
     }
 
     error ReinitializableBase_ZeroInitVersion();
@@ -34,7 +35,6 @@ interface ISystemConfig is IProxyAdminOwnedBase {
     event Initialized(uint8 version);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    function BATCH_INBOX_SLOT() external view returns (bytes32);
     function L1_CROSS_DOMAIN_MESSENGER_SLOT() external view returns (bytes32);
     function L1_ERC_721_BRIDGE_SLOT() external view returns (bytes32);
     function L1_STANDARD_BRIDGE_SLOT() external view returns (bytes32);
@@ -43,9 +43,9 @@ interface ISystemConfig is IProxyAdminOwnedBase {
     function DELAYED_WETH_SLOT() external view returns (bytes32);
     function START_BLOCK_SLOT() external view returns (bytes32);
     function UNSAFE_BLOCK_SIGNER_SLOT() external view returns (bytes32);
+    function OPCM_SLOT() external view returns (bytes32);
     function VERSION() external view returns (uint256);
     function basefeeScalar() external view returns (uint32);
-    function batchInbox() external view returns (address addr_);
     function batcherHash() external view returns (bytes32);
     function blobbasefeeScalar() external view returns (uint32);
     function disputeGameFactory() external view returns (address addr_);
@@ -61,7 +61,6 @@ interface ISystemConfig is IProxyAdminOwnedBase {
         uint64 _gasLimit,
         address _unsafeBlockSigner,
         IResourceMetering.ResourceConfig memory _config,
-        address _batchInbox,
         Addresses memory _addresses,
         uint256 _l2ChainId,
         ISuperchainConfig _superchainConfig
@@ -81,6 +80,8 @@ interface ISystemConfig is IProxyAdminOwnedBase {
     function optimismMintableERC20Factory() external view returns (address addr_);
     function optimismPortal() external view returns (address addr_);
     function delayedWETH() external view returns (address addr_);
+    function lastUsedOPCM() external view returns (address addr_);
+    function lastUsedOPCMVersion() external view returns (string memory version_);
     function overhead() external view returns (uint256);
     function owner() external view returns (address);
     function renounceOwnership() external;
@@ -88,7 +89,6 @@ interface ISystemConfig is IProxyAdminOwnedBase {
     function scalar() external view returns (uint256);
     function setBatcherHash(address _batcher) external;
     function setBatcherHash(bytes32 _batcherHash) external;
-    function setGasConfig(uint256 _overhead, uint256 _scalar) external;
     function setGasConfigEcotone(uint32 _basefeeScalar, uint32 _blobbasefeeScalar) external;
     function setGasLimit(uint64 _gasLimit) external;
     function setOperatorFeeScalars(uint32 _operatorFeeScalar, uint64 _operatorFeeConstant) external;

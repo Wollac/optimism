@@ -18,19 +18,13 @@ contract OPContractsManagerContainer {
         address proxyAdmin;
         address l1ChugSplashProxy;
         address resolvedDelegateProxy;
-        address permissionedDisputeGame1;
-        address permissionedDisputeGame2;
-        address permissionlessDisputeGame1;
-        address permissionlessDisputeGame2;
     }
 
     /// @notice Addresses of the implementation contracts.
     struct Implementations {
         address superchainConfigImpl;
-        address protocolVersionsImpl;
         address l1ERC721BridgeImpl;
         address optimismPortalImpl;
-        address optimismPortalInteropImpl;
         address ethLockboxImpl;
         address systemConfigImpl;
         address optimismMintableERC20FactoryImpl;
@@ -40,11 +34,13 @@ contract OPContractsManagerContainer {
         address anchorStateRegistryImpl;
         address delayedWETHImpl;
         address mipsImpl;
-        address faultDisputeGameV2Impl;
-        address permissionedDisputeGameV2Impl;
+        address faultDisputeGameImpl;
+        address permissionedDisputeGameImpl;
         address superFaultDisputeGameImpl;
         address superPermissionedDisputeGameImpl;
+        address zkDisputeGameImpl;
         address storageSetterImpl;
+        address sp1PlonkAdapterImpl;
     }
 
     /// @notice Address of the blueprint contracts. This is internal because if it were public the
@@ -63,7 +59,7 @@ contract OPContractsManagerContainer {
     bytes32 public immutable devFeatureBitmap;
 
     /// @notice Thrown when a development feature is enabled in production.
-    error OPContractsManagerContractsContainer_DevFeatureInProd();
+    error OPContractsManagerContainer_DevFeatureInProd();
 
     /// @param _blueprints The blueprint contract addresses.
     /// @param _implementations The implementation contract addresses.
@@ -74,8 +70,8 @@ contract OPContractsManagerContainer {
         devFeatureBitmap = _devFeatureBitmap;
 
         // Development features MUST NOT be enabled on Mainnet.
-        if (block.chainid == 1 && !_isTestingEnvironment() && uint256(_devFeatureBitmap) != 0) {
-            revert OPContractsManagerContractsContainer_DevFeatureInProd();
+        if (!_isTestingEnvironment() && uint256(_devFeatureBitmap) != 0) {
+            revert OPContractsManagerContainer_DevFeatureInProd();
         }
     }
 
@@ -101,11 +97,12 @@ contract OPContractsManagerContainer {
         return DevFeatures.isDevFeatureEnabled(devFeatureBitmap, _feature);
     }
 
-    /// @notice Returns true if the contract is running in a testing environment. Checks that the
-    ///         code for the address 0xbeefcafe is not zero, which is an address that should never
-    ///         have any code in production environments but can be made to have code in tests.
+    /// @notice Returns true if the contract is running in a testing environment. Returns true if
+    ///         we're not on mainnet or if the code for the address 0xbeefcafe is not zero. The
+    ///         magic address should never have any code in production environments but can be made
+    ///         to have code in tests.
     /// @return True if the contract is running in a testing environment, false otherwise.
     function _isTestingEnvironment() internal view returns (bool) {
-        return Constants.TESTING_ENVIRONMENT_ADDRESS.code.length > 0;
+        return block.chainid != 1 || Constants.TESTING_ENVIRONMENT_ADDRESS.code.length > 0;
     }
 }

@@ -12,7 +12,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/queue"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -62,7 +61,7 @@ func NewChannelManager(log log.Logger, metr metrics.Metricer, cfgProvider Channe
 		log:         log,
 		metr:        metr,
 		cfgProvider: cfgProvider,
-		defaultCfg:  cfgProvider.ChannelConfig(false, false),
+		defaultCfg:  cfgProvider.ChannelConfig(false),
 		rollupCfg:   rollupCfg,
 		outFactory:  NewChannelOut,
 		txChannels:  make(map[string]*channel),
@@ -109,7 +108,6 @@ func (s *channelManager) TxFailed(_id txID) {
 // TxConfirmed marks a transaction as confirmed on L1. Only if the channel timed out
 // the channelManager's state is modified.
 func (s *channelManager) TxConfirmed(_id txID, inclusionBlock eth.BlockID) {
-
 	id := _id.String()
 	if channel, ok := s.txChannels[id]; ok {
 		delete(s.txChannels, id)
@@ -130,7 +128,7 @@ func (s *channelManager) TxConfirmed(_id txID, inclusionBlock eth.BlockID) {
 // Panics if the block is not in state.
 func (s *channelManager) rewindToBlock(block eth.BlockID) {
 	initialCursor := s.blockCursor
-	idx := block.Number - s.blocks[0].Number().Uint64()
+	idx := block.Number - s.blocks[0].NumberU64()
 	if s.blocks[idx].Hash() == block.Hash && idx < uint64(s.blockCursor) {
 		s.blockCursor = int(idx)
 	} else {
@@ -225,8 +223,8 @@ func (s *channelManager) nextTxData(channel *channel) (txData, error) {
 // It will decide whether to switch DA type automatically.
 // When switching DA type, the channelManager state will be rebuilt
 // with a new ChannelConfig.
-func (s *channelManager) TxData(l1Head eth.BlockID, isPectra, isThrottling, forcePublish bool) (txData, error) {
-	channel, err := s.getReadyChannel(l1Head, forcePublish)
+func (s *channelManager) TxData(l1Head eth.BlockID, isThrottling bool, pi pubInfo) (txData, error) {
+	channel, err := s.getReadyChannel(l1Head, pi)
 	if err != nil {
 		return emptyTxData, err
 	}
@@ -237,7 +235,7 @@ func (s *channelManager) TxData(l1Head eth.BlockID, isPectra, isThrottling, forc
 	}
 
 	// Call provider method to reassess optimal DA type
-	newCfg := s.cfgProvider.ChannelConfig(isPectra, isThrottling)
+	newCfg := s.cfgProvider.ChannelConfig(isThrottling)
 
 	// No change:
 	if newCfg.UseBlobs == s.defaultCfg.UseBlobs {
@@ -260,11 +258,21 @@ func (s *channelManager) TxData(l1Head eth.BlockID, isPectra, isThrottling, forc
 	s.defaultCfg = newCfg
 
 	// Try again to get data to send on chain.
-	channel, err = s.getReadyChannel(l1Head, forcePublish)
+	channel, err = s.getReadyChannel(l1Head, pi)
 	if err != nil {
 		return emptyTxData, err
 	}
 	return s.nextTxData(channel)
+}
+
+// pubInfo is a struct that contains signal information sent on the publishSignal channel
+type pubInfo struct {
+	// forcePublish is set to true if the current channel should be force-closed and submitted now.
+	forcePublish bool
+
+	// ignoreMaxChannelDuration is set to true if we should keep the current channel open even if it's duration is exceeded.
+	// For example, if we know there are more blocks to load and we want to pack those into the current channel before sending it.
+	ignoreMaxChannelDuration bool
 }
 
 // getReadyChannel returns the next channel ready to submit data, or an error.
@@ -275,9 +283,8 @@ func (s *channelManager) TxData(l1Head eth.BlockID, isPectra, isThrottling, forc
 // there is no channel with txData
 // If forcePublish is true, it will force close channels and
 // generate frames for them.
-func (s *channelManager) getReadyChannel(l1Head eth.BlockID, forcePublish bool) (*channel, error) {
-
-	if forcePublish && s.currentChannel.TotalFrames() == 0 {
+func (s *channelManager) getReadyChannel(l1Head eth.BlockID, pi pubInfo) (*channel, error) {
+	if pi.forcePublish && s.currentChannel != nil && s.currentChannel.TotalFrames() == 0 {
 		s.log.Info("Force-closing channel and creating frames", "channel_id", s.currentChannel.ID())
 		s.currentChannel.Close()
 		if err := s.currentChannel.OutputFrames(); err != nil {
@@ -301,24 +308,38 @@ func (s *channelManager) getReadyChannel(l1Head eth.BlockID, forcePublish bool) 
 		return firstWithTxData, nil
 	}
 
-	// No pending tx data, so we have to add new blocks to the channel
-	// If we have no saved blocks, we will not be able to create valid frames
-	if s.pendingBlocks() == 0 {
+	// If there are pending blocks, add them to a channel.
+	havePendingBlocks := s.pendingBlocks() > 0
+	if havePendingBlocks {
+		if err := s.ensureChannelWithSpace(l1Head); err != nil {
+			return nil, err
+		}
+		if err := s.processBlocks(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Nothing to flush if there's no open channel.
+	if s.currentChannel == nil {
 		return nil, io.EOF
 	}
 
-	if err := s.ensureChannelWithSpace(l1Head); err != nil {
-		return nil, err
+	// If no blocks were added this call and the channel is already full, its
+	// frames were already produced by a prior call (and drained by the earlier
+	// HasTxData check above). Skip re-running outputFrames on an already-closed
+	// channel-out, which would error.
+	if !havePendingBlocks && s.currentChannel.IsFull() {
+		return nil, io.EOF
 	}
 
-	if err := s.processBlocks(); err != nil {
-		return nil, err
+	if !pi.ignoreMaxChannelDuration {
+		// Register current L1 head (which checks for the max duration timeout)
+		// only after all blocks in the manager's state have been
+		// processed, and only if we weren't told to ignore the max channel duration.
+		// The aim is to prefer to optimally pack blocks into channels when
+		// instead of timing out the channel when more blocks soon to be processed.
+		s.registerL1Block(l1Head)
 	}
-
-	// Register current L1 head only after all pending blocks have been
-	// processed. Even if a timeout will be triggered now, it is better to have
-	// all pending blocks be included in this channel for submission.
-	s.registerL1Block(l1Head)
 
 	if err := s.outputFrames(); err != nil {
 		return nil, err
@@ -424,7 +445,7 @@ func (s *channelManager) processBlocks() error {
 		s.log.Debug("Added block to channel", "id", s.currentChannel.ID(), "block", eth.ToBlockID(block))
 
 		blocksAdded += 1
-		latestL2ref = l2BlockRefFromBlockAndL1Info(block.Block, l1info)
+		latestL2ref = l2BlockRefFromPayloadAndL1Info(block.ExecutionPayload, l1info)
 		s.metr.RecordL2BlockInChannel(block.RawSize(), block.EstimatedDABytes())
 		// current block got added but channel is now full
 		if s.currentChannel.IsFull() {
@@ -461,6 +482,8 @@ func (s *channelManager) outputFrames() error {
 	s.log.Info("Channel closed",
 		"id", s.currentChannel.ID(),
 		"blocks_pending", s.pendingBlocks(),
+		"block_cursor", s.blockCursor,
+		"blocks_len", s.blocks.Len(),
 		"num_frames", s.currentChannel.TotalFrames(),
 		"input_bytes", inBytes,
 		"output_bytes", outBytes,
@@ -480,25 +503,25 @@ func (s *channelManager) outputFrames() error {
 // AddL2Block adds an L2 block to the internal blocks queue. It returns ErrReorg
 // if the block does not extend the last block loaded into the state. If no
 // blocks were added yet, the parent hash check is skipped.
-func (s *channelManager) AddL2Block(block *types.Block) error {
-	if s.tip != (common.Hash{}) && s.tip != block.ParentHash() {
+func (s *channelManager) AddL2Block(payload *eth.ExecutionPayload) error {
+	if s.tip != (common.Hash{}) && s.tip != payload.ParentHash {
 		return ErrReorg
 	}
 
-	b := ToSizedBlock(block)
+	b := ToSizedBlock(payload)
 	s.metr.RecordL2BlockInPendingQueue(b.RawSize(), b.EstimatedDABytes())
 	s.blocks.Enqueue(b)
-	s.tip = block.Hash()
+	s.tip = payload.BlockHash
 
 	return nil
 }
 
-func l2BlockRefFromBlockAndL1Info(block *types.Block, l1info *derive.L1BlockInfo) eth.L2BlockRef {
+func l2BlockRefFromPayloadAndL1Info(payload *eth.ExecutionPayload, l1info *derive.L1BlockInfo) eth.L2BlockRef {
 	return eth.L2BlockRef{
-		Hash:           block.Hash(),
-		Number:         block.NumberU64(),
-		ParentHash:     block.ParentHash(),
-		Time:           block.Time(),
+		Hash:           payload.BlockHash,
+		Number:         uint64(payload.BlockNumber),
+		ParentHash:     payload.ParentHash,
+		Time:           uint64(payload.Timestamp),
 		L1Origin:       eth.BlockID{Hash: l1info.BlockHash, Number: l1info.Number},
 		SequenceNumber: l1info.SequenceNumber,
 	}
@@ -540,7 +563,6 @@ func (s *channelManager) PruneChannels(num int) {
 	if clearCurrentChannel {
 		s.currentChannel = nil
 	}
-
 }
 
 // PendingDABytes returns the current number of bytes pending to be written to the DA layer (from blocks fetched from L2

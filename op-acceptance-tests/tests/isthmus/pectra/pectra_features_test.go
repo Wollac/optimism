@@ -10,8 +10,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
-	"github.com/ethereum-optimism/optimism/op-devstack/shim"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/txplan"
 	"github.com/ethereum/go-ethereum/common"
@@ -29,32 +28,27 @@ const (
 )
 
 type testSystem struct {
-	FunderL2 *dsl.Funder
+	FunderL2 *dsl.FunderEOA
 	L2EL     *dsl.L2ELNode
 	L2Chain  *dsl.L2Network
 }
 
 func newSystem(t devtest.T) *testSystem {
-	system := shim.NewSystem(t)
-	orch := presets.Orchestrator()
-	orch.Hydrate(system)
-
-	l2 := dsl.NewL2Network(system.L2Network(match.Assume(t, match.L2ChainA)), orch.ControlPlane())
+	preset := presets.NewMinimal(t)
+	l2 := preset.L2Chain
 	t.Require().True(l2.IsForkActive(forks.Isthmus), "Isthmus fork must be active for Pectra features")
 
-	l2EL := dsl.NewL2ELNode(l2.Escape().L2ELNode(match.WithArchive(t.Ctx())), orch.ControlPlane())
-	wallet := dsl.NewRandomHDWallet(t, 30)
-	l2Faucet := dsl.NewFaucet(l2.Escape().Faucet(match.FirstFaucet))
+	l2EL := l2.ArchiveEL()
 
 	return &testSystem{
-		FunderL2: dsl.NewFunder(wallet, l2Faucet, l2EL),
+		FunderL2: preset.FunderL2.AsFunder(l2EL),
 		L2EL:     l2EL,
 		L2Chain:  l2,
 	}
 }
 
 func TestPectra(gt *testing.T) {
-	t := devtest.SerialT(gt)
+	t := devtest.ParallelT(gt)
 	sys := newSystem(t)
 	alice := sys.FunderL2.NewFundedEOA(eth.OneTenthEther)
 
@@ -288,7 +282,7 @@ func deployProgram(t devtest.T, user *dsl.EOA, bytecode []byte) common.Address {
 	t.Logf("Deployment receipt: Status=%d, GasUsed=%d, CumulativeGasUsed=%d",
 		receipt.Status, receipt.GasUsed, receipt.CumulativeGasUsed)
 	t.Logf("Deployment transaction: BlockNumber=%d, TransactionIndex=%d",
-		receipt.BlockNumber.Uint64(), receipt.TransactionIndex)
+		bigs.Uint64Strict(receipt.BlockNumber), receipt.TransactionIndex)
 
 	require.Equal(uint64(1), receipt.Status, "Contract deployment failed")
 	require.NotNil(receipt.ContractAddress, "Contract address not set in receipt")

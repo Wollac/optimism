@@ -17,8 +17,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/txintent/bindings"
 	"github.com/ethereum-optimism/optimism/op-service/txintent/contractio"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rlp"
 )
 
 type minBaseFeeEnv struct {
@@ -83,7 +81,7 @@ func (mbf *minBaseFeeEnv) verifyMinBaseFee(t devtest.T, minBase *big.Int) {
 // waitForMinBaseFeeConfigChangeOnL2 waits until the L2 latest payload extra-data encodes the expected min base fee.
 func (mbf *minBaseFeeEnv) waitForMinBaseFeeConfigChangeOnL2(t devtest.T, expected uint64) {
 	client := mbf.l2EL.Escape().L2EthClient()
-	expectedExtraData := eth.BytesMax32(eip1559.EncodeMinBaseFeeExtraData(250, 6, expected))
+	expectedExtraData := eth.BytesMax32(eip1559.EncodeJovianExtraData(250, 6, expected))
 
 	// Check extradata in block header (for all clients)
 	var actualBlockExtraData []byte
@@ -93,23 +91,13 @@ func (mbf *minBaseFeeEnv) waitForMinBaseFeeConfigChangeOnL2(t devtest.T, expecte
 			return false
 		}
 
-		// Get header RLP and decode to access Extra field
-		headerRLP, err := info.HeaderRLP()
-		if err != nil {
+		extra := info.Extra()
+		if len(extra) != 17 {
 			return false
 		}
 
-		var header types.Header
-		if err := rlp.DecodeBytes(headerRLP, &header); err != nil {
-			return false
-		}
-
-		if len(header.Extra) != 17 {
-			return false
-		}
-
-		got := binary.BigEndian.Uint64(header.Extra[9:])
-		actualBlockExtraData = header.Extra
+		got := binary.BigEndian.Uint64(extra[9:])
+		actualBlockExtraData = extra
 		return got == expected
 	}, 2*time.Minute, 5*time.Second, "L2 min base fee in block header did not sync within timeout")
 
@@ -118,7 +106,7 @@ func (mbf *minBaseFeeEnv) waitForMinBaseFeeConfigChangeOnL2(t devtest.T, expecte
 
 // TestMinBaseFee verifies configurable minimum base fee using devstack presets.
 func TestMinBaseFee(gt *testing.T) {
-	t := devtest.SerialT(gt)
+	t := devtest.ParallelT(gt)
 	sys := presets.NewMinimal(t)
 	require := t.Require()
 

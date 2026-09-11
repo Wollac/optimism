@@ -4,195 +4,54 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"os"
 	"path"
+	"strings"
 	"time"
 
-	"github.com/ethereum-optimism/optimism/op-chain-ops/devkeys"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/contracts/gameargs"
-	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack"
-	"github.com/ethereum-optimism/optimism/op-e2e/bindings"
-	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/contracts/bindings/delegatecallproxy"
-	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/transactions"
-	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/wait"
-	"github.com/ethereum-optimism/optimism/op-service/dial"
-	"github.com/ethereum-optimism/optimism/op-service/errutil"
-	"github.com/ethereum-optimism/optimism/op-service/eth"
-	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
-	"github.com/ethereum-optimism/optimism/op-service/txmgr"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/lmittmann/w3"
 	w3eth "github.com/lmittmann/w3/module/eth"
-	"github.com/stretchr/testify/require"
+
+	"github.com/ethereum-optimism/optimism/op-chain-ops/devkeys"
+	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
+	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/contracts/bindings/delegatecallproxy"
+	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/wait"
+	"github.com/ethereum-optimism/optimism/op-service/dial"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/retry"
+	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
+	"github.com/ethereum-optimism/optimism/op-service/txplan"
 )
 
-func WithSuperRoots(l1ChainID eth.ChainID, l1ELID stack.L1ELNodeID, l2CLID stack.L2CLNodeID, supervisorID stack.SupervisorID, primaryL2 eth.ChainID) stack.Option[*Orchestrator] {
-	return stack.FnOption[*Orchestrator]{
-		FinallyFn: func(o *Orchestrator) {
-			t := o.P()
-			require := t.Require()
-			require.NotNil(o.wb, "must have a world builder")
-			require.NotEmpty(o.wb.output.ImplementationsDeployment.OpcmImpl, "must have an OPCM implementation")
+// V2 structs for OPCM >= 7.0.0 (using IOPContractsManagerMigrator interface)
+type DisputeGameConfigV2 struct {
+	Enabled  bool
+	InitBond *big.Int
+	GameType uint32
+	GameArgs []byte
+}
 
-			l1EL, ok := o.l1ELs.Get(l1ELID)
-			require.True(ok, "must have L1 EL node")
-			rpcClient, err := rpc.DialContext(t.Ctx(), l1EL.UserRPC())
-			require.NoError(err)
-			client := ethclient.NewClient(rpcClient)
-			w3Client := w3.NewClient(rpcClient)
+// Proposal matches the Solidity Proposal struct: (bytes32 root, uint256 l2SequenceNumber)
+type Proposal struct {
+	Root             common.Hash
+	L2SequenceNumber *big.Int
+}
 
-			l2CL, ok := o.l2CLs.Get(l2CLID)
-			require.True(ok, "must have L2 CL node")
-			rollupClientProvider, err := dial.NewStaticL2RollupProvider(t.Ctx(), t.Logger(), l2CL.UserRPC())
-			require.NoError(err)
-			rollupClient, err := rollupClientProvider.RollupClient(t.Ctx())
-			require.NoError(err)
-			require.NoError(wait.ForSafeBlock(t.Ctx(), rollupClient, 1))
-			header, err := client.HeaderByNumber(t.Ctx(), big.NewInt(int64(rpc.SafeBlockNumber)))
-			require.NoError(err)
-			superRoot := getSuperRoot(t, o, header.Time, supervisorID)
-
-			l1pao, err := o.keys.Address(devkeys.ChainOperatorKeys(l1ChainID.ToBig())(devkeys.L1ProxyAdminOwnerRole))
-			require.NoError(err, "must have L1 proxy admin owner private key")
-
-			superchainConfigAddr := o.wb.outSuperchainDeployment.SuperchainConfigAddr()
-			superchainProxyAdmin := getProxyAdmin(t, w3Client, superchainConfigAddr)
-			require.NotEmpty(superchainProxyAdmin, "superchain proxy admin address is empty")
-
-			absoluteCannonPrestate := getInteropCannonAbsolutePrestate(t)
-			absoluteCannonKonaPrestate := getInteropCannonKonaAbsolutePrestate(t)
-			var opChainConfigs []bindings.OPContractsManagerOpChainConfig
-			var l2ChainIDs []eth.ChainID
-			for l2ChainID, l2Deployment := range o.wb.outL2Deployment {
-				l2ChainIDs = append(l2ChainIDs, l2ChainID)
-				opChainConfigs = append(opChainConfigs, bindings.OPContractsManagerOpChainConfig{
-					SystemConfigProxy:  l2Deployment.SystemConfigProxyAddr(),
-					CannonPrestate:     absoluteCannonPrestate,
-					CannonKonaPrestate: absoluteCannonKonaPrestate,
-				})
-			}
-
-			// Use primaryL2 to determine which challenger / proposer roles to promote to the shared permissioned fdg
-			permissionedChainOps := devkeys.ChainOperatorKeys(primaryL2.ToBig())
-			proposer, err := o.keys.Address(permissionedChainOps(devkeys.ProposerRole))
-			o.P().Require().NoError(err, "must have configured proposer")
-			challenger, err := o.keys.Address(permissionedChainOps(devkeys.ChallengerRole))
-			o.P().Require().NoError(err, "must have configured challenger")
-
-			opcmABI, err := bindings.OPContractsManagerMetaData.GetAbi()
-			o.P().Require().NoError(err, "invalid OPCM ABI")
-			opcmAddr := o.wb.output.ImplementationsDeployment.OpcmImpl
-			contract := batching.NewBoundContract(opcmABI, opcmAddr)
-			migrateInput := bindings.OPContractsManagerInteropMigratorMigrateInput{
-				UsePermissionlessGame: true,
-				StartingAnchorRoot: bindings.Proposal{
-					Root:             common.Hash(superRoot),
-					L2SequenceNumber: big.NewInt(int64(header.Time)),
-				},
-				GameParameters: bindings.OPContractsManagerInteropMigratorGameParameters{
-					Proposer:         proposer,
-					Challenger:       challenger,
-					MaxGameDepth:     big.NewInt(73),
-					SplitDepth:       big.NewInt(30),
-					InitBond:         big.NewInt(0),
-					ClockExtension:   10800,
-					MaxClockDuration: 302400,
-				},
-				OpChainConfigs: opChainConfigs,
-			}
-			migrateCall := contract.Call("migrate", migrateInput)
-			migrateCallData, err := migrateCall.Pack()
-			require.NoError(err)
-
-			chainOps := devkeys.ChainOperatorKeys(l1ChainID.ToBig())
-			l1PAOKey, err := o.keys.Secret(chainOps(devkeys.L1ProxyAdminOwnerRole))
-			require.NoError(err, "must have configured L1 proxy admin owner private key")
-			transactOpts, err := bind.NewKeyedTransactorWithChainID(l1PAOKey, l1ChainID.ToBig())
-			require.NoError(err, "must have transact opts")
-			transactOpts.Context = t.Ctx()
-
-			t.Log("Deploying delegate call proxy contract")
-			// The DelegateCallProxy is used to simulate a GnosisSafe proxy that satisfies the delegatecall requirement of the OPCM.
-			delegateCallProxy, proxyContract := deployDelegateCallProxy(t, transactOpts, client, l1pao)
-			oldSuperchainProxyAdminOwner := getOwner(t, w3Client, superchainProxyAdmin)
-			transferOwnership(t, l1PAOKey, client, superchainProxyAdmin, delegateCallProxy)
-
-			oldDisputeGameFactories := make(map[eth.ChainID]common.Address)
-			for i, opChainConfig := range opChainConfigs {
-				var portal common.Address
-				require.NoError(
-					w3Client.Call(
-						w3eth.CallFunc(opChainConfig.SystemConfigProxy, optimismPortalFn).Returns(&portal),
-					))
-				portalProxyAdmin := getProxyAdmin(t, w3Client, portal)
-				transferOwnership(t, l1PAOKey, client, portalProxyAdmin, delegateCallProxy)
-
-				dgf := getDisputeGameFactory(t, w3Client, portal)
-				transferOwnership(t, l1PAOKey, client, dgf, delegateCallProxy)
-				oldDisputeGameFactories[l2ChainIDs[i]] = dgf
-			}
-
-			t.Log("Executing delegate call")
-			migrateTx, err := proxyContract.ExecuteDelegateCall(transactOpts, opcmAddr, migrateCallData)
-			require.NoErrorf(err, "migrate delegatecall failed: %v", errutil.TryAddRevertReason(err))
-			_, err = wait.ForReceiptOK(t.Ctx(), client, migrateTx.Hash())
-			require.NoError(err)
-
-			var sharedDGF common.Address
-			{
-				for _, l2Deployment := range o.wb.outL2Deployment {
-					portal := getOptimismPortal(t, w3Client, l2Deployment.SystemConfigProxyAddr())
-					addr := getDisputeGameFactory(t, w3Client, portal)
-					if sharedDGF == (common.Address{}) {
-						sharedDGF = addr
-					} else {
-						require.Equal(sharedDGF, addr, "dispute game factory address is not the same for all deployments")
-					}
-				}
-				require.NotEmpty(getSuperGameImpl(t, w3Client, sharedDGF))
-				o.wb.outInteropMigration = &InteropMigration{
-					DisputeGameFactory: sharedDGF,
-				}
-			}
-
-			// reset ownership transfers
-			resetOwnershipAfterMigration(t,
-				o,
-				l1ChainID.ToBig(),
-				l1PAOKey,
-				w3Client,
-				client,
-				delegateCallProxy,
-				opChainConfigs,
-			)
-
-			resetOldDisputeGameFactories(t,
-				o,
-				l1ChainID.ToBig(),
-				l1PAOKey,
-				client,
-				delegateCallProxy,
-				oldDisputeGameFactories,
-			)
-
-			transferOwnershipForDelegateCallProxy(t, l1ChainID.ToBig(), l1PAOKey, client, delegateCallProxy, superchainProxyAdmin, oldSuperchainProxyAdminOwner)
-
-			superchainProxyAdminOwner := getOwner(t, w3Client, superchainProxyAdmin)
-			t.Require().Equal(oldSuperchainProxyAdminOwner, superchainProxyAdminOwner, "superchain proxy admin owner is not the L1PAO")
-
-			for _, l2Deployment := range o.wb.outL2Deployment {
-				l2Deployment.disputeGameFactoryProxy = sharedDGF
-			}
-			t.Log("Interop migration complete")
-		},
-	}
+type MigrateInputV2 struct {
+	ChainSystemConfigs        []common.Address
+	DisputeGameConfigs        []DisputeGameConfigV2
+	StartingAnchorRoot        Proposal
+	StartingRespectedGameType uint32
 }
 
 func deployDelegateCallProxy(t devtest.CommonT, transactOpts *bind.TransactOpts, client *ethclient.Client, owner common.Address) (common.Address, *delegatecallproxy.Delegatecallproxy) {
@@ -204,59 +63,219 @@ func deployDelegateCallProxy(t devtest.CommonT, transactOpts *bind.TransactOpts,
 	return deployAddress, proxyContract
 }
 
-func getSuperRoot(t devtest.CommonT, o *Orchestrator, timestamp uint64, supervisorID stack.SupervisorID) eth.Bytes32 {
-	supervisor, ok := o.supervisors.Get(supervisorID)
-	t.Require().True(ok, "must have supervisor")
+// delegateCallWithSetCode executes a delegatecall to target with the given data
+// by delegating the sender's code to a DelegateCallProxy via EIP-7702 SetCode.
+// The sender EOA temporarily gets DelegateCallProxy code, calls executeDelegateCall
+// on itself, and the target runs via delegatecall in the sender's context.
+// This avoids transferring ownership of contracts to a temporary proxy.
+//
+// Uses txplan for nonce management, gas pricing, signing, and retry — the same
+// infrastructure that dsl.EOA.PlanAuth uses, without requiring a dsl.EOA.
+func delegateCallWithSetCode(
+	t devtest.CommonT,
+	privateKey *ecdsa.PrivateKey,
+	client *ethclient.Client,
+	target common.Address,
+	data []byte,
+) {
+	require := t.Require()
+	ctx := t.Ctx()
+	sender := crypto.PubkeyToAddress(privateKey.PublicKey)
 
-	client, err := dial.DialSupervisorClientWithTimeout(t.Ctx(), t.Logger(), supervisor.UserRPC())
+	// Deploy DelegateCallProxy as code reference for SetCode delegation
+	chainID, err := client.ChainID(ctx)
+	require.NoError(err)
+	transactOpts, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	require.NoError(err)
+	transactOpts.Context = ctx
+	proxyAddr, _ := deployDelegateCallProxy(t, transactOpts, client, sender)
+
+	// Encode executeDelegateCall(target, data) calldata
+	proxyABI, err := delegatecallproxy.DelegatecallproxyMetaData.GetAbi()
+	require.NoError(err)
+	calldata, err := proxyABI.Pack("executeDelegateCall", target, data)
+	require.NoError(err)
+
+	// Build a SetCode tx using txplan — same options PlanAuth uses,
+	// plus the delegatecall payload as tx data.
+	toAddr := sender
+	tx := txplan.NewPlannedTx(
+		txplan.WithChainID(client),
+		txplan.WithPrivateKey(privateKey),
+		txplan.WithPendingNonce(client),
+		txplan.WithAgainstLatestBlockEthClient(client),
+		txplan.WithType(types.SetCodeTxType),
+		txplan.WithTo(&toAddr),
+		txplan.WithAuthorizationTo(proxyAddr),
+		txplan.WithData(calldata),
+		// Fixed gas limit because eth_estimateGas doesn't handle EIP-7702 authorizations.
+		// Use the EIP-7825 max transaction gas limit to give the migration maximum room.
+		txplan.WithGasLimit(params.MaxTxGas),
+		txplan.WithRetrySubmission(client, 5, retry.Exponential()),
+		txplan.WithRetryInclusion(txplan.FromGethReceipts(client), 10, retry.Exponential()),
+	)
+
+	receipt, err := tx.Included.Eval(ctx)
+	require.NoError(err)
+	require.Equal(types.ReceiptStatusSuccessful, receipt.Status, "delegatecall via SetCode failed")
+}
+
+func awaitSuperrootTime(t devtest.T, cls ...L2CLNode) uint64 {
+	t.Require().NotEmpty(cls, "at least one L2 CL is required")
+
+	var superrootTime uint64
+	for _, l2CL := range cls {
+		rollupClient, err := dial.DialRollupClientWithTimeout(t.Ctx(), t.Logger(), l2CL.UserRPC())
+		t.Require().NoError(err)
+		defer rollupClient.Close()
+
+		ctx, cancel := context.WithTimeout(t.Ctx(), 2*time.Minute)
+		err = wait.For(ctx, time.Second, func() (bool, error) {
+			status, err := rollupClient.SyncStatus(ctx)
+			if err != nil {
+				return false, err
+			}
+			if status == nil || status.SafeL2.Number == 0 {
+				return false, nil
+			}
+			superrootTime = status.SafeL2.Time
+			return true, nil
+		})
+		cancel()
+		t.Require().NoError(err, "waiting for chain safe head to advance failed")
+	}
+	return superrootTime
+}
+
+func getSupernodeSuperRoot(t devtest.T, supernode *SuperNode, timestamp uint64) eth.Bytes32 {
+	return getSuperRoot(t, supernode.UserRPC(), timestamp)
+}
+
+func getSuperRoot(t devtest.T, endpoint string, timestamp uint64) eth.Bytes32 {
+	client, err := dial.DialSuperNodeClientWithTimeout(t.Ctx(), t.Logger(), endpoint)
 	t.Require().NoError(err)
 
-	// wait for the super root to be ready
-	ctx, cancel := context.WithTimeout(t.Ctx(), time.Minute*2)
-	err = wait.For(ctx, time.Second*1, func() (bool, error) {
-		status, err := client.SyncStatus(ctx)
+	var superRoot eth.Bytes32
+	ctx, cancel := context.WithTimeout(t.Ctx(), 2*time.Minute)
+	err = wait.For(ctx, time.Second, func() (bool, error) {
+		resp, err := client.SuperRootAtTimestamp(ctx, timestamp)
 		if err != nil {
-			return false, err
+			t.Logf("DEBUG: Failed to get super root at timestamp %d: err: %v", timestamp, err)
+			return false, nil
 		}
-		return timestamp < status.MinSyncedL1.Time, nil
+		if resp.Data == nil {
+			return false, nil
+		}
+		superRoot = resp.Data.SuperRoot
+		return true, nil
 	})
 	cancel()
-	t.Require().NoError(err, "waiting for supervisor to sync failed")
-
-	super, err := client.SuperRootAtTimestamp(t.Ctx(), hexutil.Uint64(timestamp))
-	t.Require().NoError(err, "super root at timestamp failed")
-	return super.SuperRoot
+	t.Require().NoError(err, "waiting for superroot to be ready failed")
+	return superRoot
 }
 
-func getInteropCannonAbsolutePrestate(t devtest.CommonT) common.Hash {
-	return getAbsolutePrestate(t, "op-program/bin/prestate-proof-interop.json")
+func migrateSuperRootsWithProposal(
+	t devtest.T,
+	keys devkeys.Keys,
+	migration *interopMigrationState,
+	l1ChainID eth.ChainID,
+	l1EL L1ELNode,
+	startingAnchorRoot Proposal,
+	primaryL2 eth.ChainID,
+) common.Address {
+	require := t.Require()
+	require.NotNil(migration, "interop migration state is required")
+	require.NotEmpty(migration.opcmImpl, "must have an OPCM implementation")
+	require.NotEmpty(migration.superchainConfigAddr, "must have a superchain deployment")
+	require.NotEmpty(migration.l2Deployments, "must have L2 deployments for interop migration")
+
+	rpcClient, err := rpc.DialContext(t.Ctx(), l1EL.UserRPC())
+	require.NoError(err)
+	client := ethclient.NewClient(rpcClient)
+	w3Client := w3.NewClient(rpcClient)
+
+	absoluteCannonKonaPrestate := getCannonKonaAbsolutePrestate(t)
+
+	permissionedChainOps := devkeys.ChainOperatorKeys(primaryL2.ToBig())
+	proposer, err := keys.Address(permissionedChainOps(devkeys.ProposerRole))
+	require.NoError(err, "must have configured proposer")
+
+	chainSystemConfigs := sortedChainSystemConfigs(migration)
+
+	// Use the v2 migrator ABI directly (v1 OPCM is deleted, bindings are stale)
+	migratorABI, err := OPContractsManagerMigratorABI()
+	require.NoError(err, "invalid migrator ABI")
+	contract := batching.NewBoundContract(migratorABI, migration.opcmImpl)
+
+	// ABI-encode simplified super-permissioned game args: (address proposer)
+	addressTy, _ := abi.NewType("address", "", nil)
+	superPermissionedGameArgs, err := abi.Arguments{{Type: addressTy}}.Pack(proposer)
+	require.NoError(err, "failed to encode super permissioned game args")
+
+	migrateInputV2 := MigrateInputV2{
+		ChainSystemConfigs: chainSystemConfigs,
+		DisputeGameConfigs: []DisputeGameConfigV2{
+			{
+				Enabled:  true,
+				InitBond: new(big.Int),
+				GameType: superPermissionedGameType,
+				GameArgs: superPermissionedGameArgs,
+			},
+			{
+				Enabled:  true,
+				InitBond: new(big.Int).Set(defaultInitBond),
+				GameType: superCannonKonaGameType,
+				GameArgs: absoluteCannonKonaPrestate[:],
+			},
+		},
+		StartingAnchorRoot:        startingAnchorRoot,
+		StartingRespectedGameType: superCannonKonaGameType,
+	}
+	migrateCall := contract.Call("migrate", migrateInputV2)
+	migrateCallData, err := migrateCall.Pack()
+	require.NoError(err)
+
+	_, l1PAOKey := resolveL1ProxyAdminOwner(t, keys, l1ChainID)
+
+	t.Log("Executing OPCM migration via SetCode delegatecall")
+	delegateCallWithSetCode(t, l1PAOKey, client, migration.opcmImpl, migrateCallData)
+
+	var sharedDGF common.Address
+	for _, l2Deployment := range migration.l2Deployments {
+		portal := getOptimismPortal(t, w3Client, l2Deployment.SystemConfigProxyAddr())
+		addr := getDisputeGameFactory(t, w3Client, portal)
+		if sharedDGF == (common.Address{}) {
+			sharedDGF = addr
+		} else {
+			require.Equal(sharedDGF, addr, "dispute game factory address is not the same for all deployments")
+		}
+	}
+	require.NotEmpty(getGameImpl(t, w3Client, sharedDGF, superCannonKonaGameType))
+
+	for chainID, l2Deployment := range migration.l2Deployments {
+		l2Deployment.disputeGameFactoryProxy = sharedDGF
+		migration.l2Deployments[chainID] = l2Deployment
+	}
+	t.Log("Interop migration complete")
+	return sharedDGF
 }
 
-func getInteropCannonKonaAbsolutePrestate(t devtest.CommonT) common.Hash {
-	return loadKonaVersions(t).InteropPrestateHash
+func sortedChainSystemConfigs(migration *interopMigrationState) []common.Address {
+	// Migrator requires chainSystemConfigs sorted ascending by l2ChainId.
+	sortedChainIDs := make([]eth.ChainID, 0, len(migration.l2Deployments))
+	for chainID := range migration.l2Deployments {
+		sortedChainIDs = append(sortedChainIDs, chainID)
+	}
+	eth.SortChainID(sortedChainIDs)
+	chainSystemConfigs := make([]common.Address, 0, len(sortedChainIDs))
+	for _, chainID := range sortedChainIDs {
+		chainSystemConfigs = append(chainSystemConfigs, migration.l2Deployments[chainID].SystemConfigProxyAddr())
+	}
+	return chainSystemConfigs
 }
 
 func getCannonKonaAbsolutePrestate(t devtest.CommonT) common.Hash {
-	return loadKonaVersions(t).PrestateHash
-}
-
-func loadKonaVersions(t devtest.CommonT) konaVersions {
-	konaVersionPath := "kona/version.json"
-	root, err := findMonorepoRoot(konaVersionPath)
-	t.Require().NoError(err)
-	p := path.Join(root, konaVersionPath)
-	data, err := os.ReadFile(p)
-	t.Require().NoError(err, "Failed to read kona versions")
-	var versions konaVersions
-	err = json.Unmarshal(data, &versions)
-	require.NoError(t, err, "Failed to parse kona versions")
-	return versions
-}
-
-type konaVersions struct {
-	Version             string      `json:"version"`
-	PrestateHash        common.Hash `json:"prestateHash"`
-	InteropPrestateHash common.Hash `json:"interopPrestateHash"`
+	return getAbsolutePrestate(t, "rust/kona/prestate-artifacts-cannon/prestate-proof.json")
 }
 
 func getAbsolutePrestate(t devtest.CommonT, prestatePath string) common.Hash {
@@ -274,22 +293,14 @@ func getAbsolutePrestate(t devtest.CommonT, prestatePath string) common.Hash {
 }
 
 const (
-	superCannonGameType       = 4
 	superPermissionedGameType = 5
+	superCannonKonaGameType   = 9
 )
 
 var (
-	optimismPortalFn      = w3.MustNewFunc("optimismPortal()", "address")
-	disputeGameFactoryFn  = w3.MustNewFunc("disputeGameFactory()", "address")
-	gameImplsFn           = w3.MustNewFunc("gameImpls(uint32)", "address")
-	gameArgsFn            = w3.MustNewFunc("gameArgs(uint32)", "bytes")
-	ownerFn               = w3.MustNewFunc("owner()", "address")
-	proxyAdminFn          = w3.MustNewFunc("proxyAdmin()", "address")
-	adminFn               = w3.MustNewFunc("admin()", "address")
-	proxyAdminOwnerFn     = w3.MustNewFunc("proxyAdminOwner()", "address")
-	ethLockboxFn          = w3.MustNewFunc("ethLockbox()", "address")
-	anchorStateRegistryFn = w3.MustNewFunc("anchorStateRegistry()", "address")
-	transferOwnershipFn   = w3.MustNewFunc("transferOwnership(address)", "")
+	optimismPortalFn     = w3.MustNewFunc("optimismPortal()", "address")
+	disputeGameFactoryFn = w3.MustNewFunc("disputeGameFactory()", "address")
+	gameImplsFn          = w3.MustNewFunc("gameImpls(uint32)", "address")
 )
 
 func getOptimismPortal(t devtest.CommonT, client *w3.Client, systemConfigProxy common.Address) common.Address {
@@ -306,165 +317,35 @@ func getDisputeGameFactory(t devtest.CommonT, client *w3.Client, portal common.A
 	return addr
 }
 
-func getSuperGameImpl(t devtest.CommonT, client *w3.Client, dgf common.Address) common.Address {
+func getGameImpl(t devtest.CommonT, client *w3.Client, dgf common.Address, gameType uint32) common.Address {
 	var addr common.Address
-	err := client.Call(w3eth.CallFunc(dgf, gameImplsFn, uint32(superCannonGameType)).Returns(&addr))
+	err := client.Call(w3eth.CallFunc(dgf, gameImplsFn, gameType).Returns(&addr))
 	t.Require().NoError(err)
 	return addr
 }
 
-func getOwner(t devtest.CommonT, client *w3.Client, addr common.Address) common.Address {
-	var owner common.Address
-	err := client.Call(w3eth.CallFunc(addr, ownerFn).Returns(&owner))
-	t.Require().NoError(err)
-	return owner
-}
-
-func getAdmin(t devtest.CommonT, client *w3.Client, addr common.Address) common.Address {
-	var admin common.Address
-	err := client.Call(w3eth.CallFunc(addr, adminFn).Returns(&admin))
-	t.Require().NoError(err)
-	return admin
-}
-
-func getProxyAdminOwner(t devtest.CommonT, client *w3.Client, addr common.Address) common.Address {
-	var proxyAdminOwner common.Address
-	err := client.Call(w3eth.CallFunc(addr, proxyAdminOwnerFn).Returns(&proxyAdminOwner))
-	t.Require().NoError(err)
-	return proxyAdminOwner
-}
-
-func getProxyAdmin(t devtest.CommonT, client *w3.Client, addr common.Address) common.Address {
-	var proxyAdmin common.Address
-	err := client.Call(w3eth.CallFunc(addr, proxyAdminFn).Returns(&proxyAdmin))
-	t.Require().NoError(err)
-	return proxyAdmin
-}
-
-func transferOwnership(t devtest.CommonT, privateKey *ecdsa.PrivateKey, client *ethclient.Client, l1ProxyAdmin common.Address, newOwner common.Address) {
-	data, err := transferOwnershipFn.EncodeArgs(newOwner)
-	t.Require().NoError(err)
-
-	candidate := txmgr.TxCandidate{
-		To:       &l1ProxyAdmin,
-		TxData:   data,
-		GasLimit: 1_000_000,
+// OPContractsManagerMigratorABI loads the ABI for the OPContractsManagerMigrator contract
+// from the forge artifact file.
+func OPContractsManagerMigratorABI() (*abi.ABI, error) {
+	root, err := findMonorepoRoot("packages/contracts-bedrock/forge-artifacts")
+	if err != nil {
+		return nil, fmt.Errorf("failed to find monorepo root: %w", err)
 	}
-	_, receipt, err := transactions.SendTx(t.Ctx(), client, candidate, privateKey)
-	t.Require().NoErrorf(err, "transferOwnership failed: %v", errutil.TryAddRevertReason(err))
-	t.Require().Equal(receipt.Status, types.ReceiptStatusSuccessful, "transferOwnership failed")
-}
-
-func transferOwnershipForDelegateCallProxy(
-	t devtest.CommonT,
-	transactChainID *big.Int,
-	privateKey *ecdsa.PrivateKey,
-	client *ethclient.Client,
-	delegateCallProxy common.Address,
-	proxyAdminOwned common.Address,
-	newOwner common.Address,
-) {
-	transactOpts, err := bind.NewKeyedTransactorWithChainID(privateKey, transactChainID)
-	t.Require().NoError(err, "must have transact opts")
-	transactOpts.Context = t.Ctx()
-
-	abi, err := delegatecallproxy.DelegatecallproxyMetaData.GetAbi()
-	t.Require().NoError(err, "failed to get abi")
-	contract := batching.NewBoundContract(abi, delegateCallProxy)
-	call := contract.Call("transferOwnership", proxyAdminOwned, newOwner)
-	data, err := call.Pack()
-	t.Require().NoError(err)
-
-	candidate := txmgr.TxCandidate{
-		To:       &delegateCallProxy,
-		TxData:   data,
-		GasLimit: 1_000_000,
+	artifactPath := path.Join(root, "packages", "contracts-bedrock", "forge-artifacts",
+		"OPContractsManagerMigrator.sol", "OPContractsManagerMigrator.json")
+	data, err := os.ReadFile(artifactPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read migrator artifact: %w", err)
 	}
-	_, receipt, err := transactions.SendTx(t.Ctx(), client, candidate, privateKey)
-	t.Require().NoErrorf(err, "transferOwnership failed: %v", errutil.TryAddRevertReason(err))
-	t.Require().Equal(receipt.Status, types.ReceiptStatusSuccessful, "transferOwnership failed")
-}
-
-func resetOwnershipAfterMigration(
-	t devtest.CommonT,
-	o *Orchestrator,
-	l1ChainID *big.Int,
-	ownerPrivateKey *ecdsa.PrivateKey,
-	w3Client *w3.Client,
-	client *ethclient.Client,
-	delegateCallProxy common.Address,
-	opChainConfigs []bindings.OPContractsManagerOpChainConfig,
-) {
-	l1PAO, err := o.keys.Address(devkeys.ChainOperatorKeys(l1ChainID)(devkeys.L1ProxyAdminOwnerRole))
-	t.Require().NoError(err, "must have L1 proxy admin owner private key")
-
-	portal0 := getOptimismPortal(t, w3Client, opChainConfigs[0].SystemConfigProxy)
-	sharedDGF := getDisputeGameFactory(t, w3Client, portal0)
-	transferOwnershipForDelegateCallProxy(
-		t,
-		l1ChainID,
-		ownerPrivateKey,
-		client,
-		delegateCallProxy,
-		sharedDGF,
-		l1PAO,
-	)
-
-	var sharedEthLockboxProxy common.Address
-	err = w3Client.Call(w3eth.CallFunc(portal0, ethLockboxFn).Returns(&sharedEthLockboxProxy))
-	t.Require().NoError(err)
-	proxyAdmin := getAdmin(t, w3Client, sharedEthLockboxProxy)
-	transferOwnershipForDelegateCallProxy(
-		t,
-		l1ChainID,
-		ownerPrivateKey,
-		client,
-		delegateCallProxy,
-		proxyAdmin,
-		l1PAO,
-	)
-
-	// The Proxy Admin owner is changed. Assert that the admin of other proxies are consistent
-	var sharedAnchorStateRegistryProxy common.Address
-	err = w3Client.Call(w3eth.CallFunc(portal0, anchorStateRegistryFn).Returns(&sharedAnchorStateRegistryProxy))
-	t.Require().NoError(err)
-	asrAAdminOwner := getProxyAdminOwner(t, w3Client, sharedAnchorStateRegistryProxy)
-	t.Require().Equal(l1PAO, asrAAdminOwner, "sharedAnchorStateRegistryProxy proxy admin owner is not the L1PAO")
-
-	gameTypes := []uint32{superPermissionedGameType, superCannonGameType}
-	for _, gameType := range gameTypes {
-		var gameArgsBytes []byte
-		err = w3Client.Call(w3eth.CallFunc(sharedDGF, gameArgsFn, gameType).Returns(&gameArgsBytes))
-		t.Require().NoError(err)
-		gameArgs, err := gameargs.Parse(gameArgsBytes)
-		t.Require().NoErrorf(err, "invalid game args for gameType %d", gameType)
-		wethAdminOwner := getProxyAdminOwner(t, w3Client, gameArgs.Weth)
-		t.Require().Equal(l1PAO, wethAdminOwner, "wethProxy proxy admin owner is not the L1PAO")
+	var artifact struct {
+		ABI json.RawMessage `json:"abi"`
 	}
-}
-
-func resetOldDisputeGameFactories(
-	t devtest.CommonT,
-	o *Orchestrator,
-	l1ChainID *big.Int,
-	ownerPrivateKey *ecdsa.PrivateKey,
-	client *ethclient.Client,
-	delegateCallProxy common.Address,
-	oldDisputeGameFactories map[eth.ChainID]common.Address,
-) {
-	for l2ChainID, oldDGF := range oldDisputeGameFactories {
-		chainOpsForL2 := devkeys.ChainOperatorKeys(l2ChainID.ToBig())
-		l1PAOForL2, err := o.keys.Address(chainOpsForL2(devkeys.L1ProxyAdminOwnerRole))
-		t.Require().NoError(err, "must have configured L1 proxy admin owner private key")
-		// Not required since the old DGFs are not used; but done to prevent surprises later
-		transferOwnershipForDelegateCallProxy(
-			t,
-			l1ChainID,
-			ownerPrivateKey,
-			client,
-			delegateCallProxy,
-			oldDGF,
-			l1PAOForL2,
-		)
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return nil, fmt.Errorf("failed to parse migrator artifact: %w", err)
 	}
+	parsed, err := abi.JSON(strings.NewReader(string(artifact.ABI)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse migrator ABI: %w", err)
+	}
+	return &parsed, nil
 }

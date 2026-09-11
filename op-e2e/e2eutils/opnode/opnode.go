@@ -12,20 +12,12 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/node/runcfg"
 	"github.com/ethereum-optimism/optimism/op-node/p2p"
 	"github.com/ethereum-optimism/optimism/op-service/cliapp"
+	"github.com/ethereum-optimism/optimism/op-service/clock"
 	"github.com/ethereum-optimism/optimism/op-service/endpoint"
-	"github.com/ethereum-optimism/optimism/op-service/eth"
 )
 
 type Opnode struct {
 	node *rollupNode.OpNode
-}
-
-func (o *Opnode) InteropRPC() (endpoint string, jwtSecret eth.Bytes32) {
-	return o.node.InteropRPC()
-}
-
-func (o *Opnode) InteropRPCPort() (int, error) {
-	return o.node.InteropRPCPort()
 }
 
 func (o *Opnode) UserRPC() endpoint.RPC {
@@ -54,7 +46,7 @@ func (o *Opnode) P2P() p2p.Node {
 
 var _ services.RollupNode = (*Opnode)(nil)
 
-func NewOpnode(l log.Logger, c *config.Config, errFn func(error)) (*Opnode, error) {
+func NewOpnode(l log.Logger, c *config.Config, clk clock.Clock, errFn func(error)) (*Opnode, error) {
 	if err := c.Check(); err != nil {
 		return nil, err
 	}
@@ -65,12 +57,17 @@ func NewOpnode(l log.Logger, c *config.Config, errFn func(error)) (*Opnode, erro
 			postCtx, postCancel := context.WithCancel(context.Background())
 			postCancel() // don't allow the stopping to continue for longer than needed
 			if err := cycle.Stop(postCtx); err != nil {
-				errFn(err)
+				// Report the original cause that triggered shutdown, not the
+				// stop error. The stop context is pre-cancelled, so Stop may
+				// return "context canceled" from StopSequencer — that is a
+				// consequence of force-quit, not an additional failure.
+				// errFn must be goroutine-safe (use t.Error, not require/FailNow).
+				errFn(errCause)
 			}
 			l.Warn("closed op-node!")
 		}()
 	}
-	node, err := rollupNode.New(context.Background(), c, l, "", metrics.NewMetrics(""))
+	node, err := rollupNode.New(context.Background(), c, l, "", metrics.NewMetrics("", nil), clk)
 	if err != nil {
 		return nil, err
 	}

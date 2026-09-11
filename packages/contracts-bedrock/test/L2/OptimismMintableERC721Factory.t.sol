@@ -2,6 +2,7 @@
 pragma solidity 0.8.15;
 
 import { CommonTest } from "test/setup/CommonTest.sol";
+import { DeployUtils } from "scripts/libraries/DeployUtils.sol";
 import { OptimismMintableERC721 } from "src/L2/OptimismMintableERC721.sol";
 
 /// @title OptimismMintableERC721Factory_TestInit
@@ -20,7 +21,7 @@ abstract contract OptimismMintableERC721Factory_TestInit is CommonTest {
     {
         bytes memory constructorArgs =
             abi.encode(address(l2ERC721Bridge), deploy.cfg().l1ChainID(), _remote, _name, _symbol);
-        bytes memory bytecode = abi.encodePacked(type(OptimismMintableERC721).creationCode, constructorArgs);
+        bytes memory bytecode = abi.encodePacked(DeployUtils.getCode("OptimismMintableERC721"), constructorArgs);
         bytes32 salt = keccak256(abi.encode(_remote, _name, _symbol));
         bytes32 hash = keccak256(
             abi.encodePacked(bytes1(0xff), address(l2OptimismMintableERC721Factory), salt, keccak256(bytecode))
@@ -29,11 +30,11 @@ abstract contract OptimismMintableERC721Factory_TestInit is CommonTest {
     }
 }
 
-/// @title OptimismMintableERC721Factory_Constructor_Test
-/// @notice Tests the `constructor` of the `OptimismMintableERC721Factory` contract.
-contract OptimismMintableERC721Factory_Constructor_Test is OptimismMintableERC721Factory_TestInit {
-    /// @notice Tests that the constructor sets the correct values.
-    function test_constructor_succeeds() external view {
+/// @title OptimismMintableERC721Factory_Initialize_Test
+/// @notice Tests the initialization of the `OptimismMintableERC721Factory` contract.
+contract OptimismMintableERC721Factory_Initialize_Test is OptimismMintableERC721Factory_TestInit {
+    /// @notice Tests that the initialization sets the correct values.
+    function test_initialize_succeeds() external view {
         assertEq(l2OptimismMintableERC721Factory.BRIDGE(), address(l2ERC721Bridge));
         assertEq(l2OptimismMintableERC721Factory.bridge(), address(l2ERC721Bridge));
         assertEq(l2OptimismMintableERC721Factory.REMOTE_CHAIN_ID(), deploy.cfg().l1ChainID());

@@ -6,28 +6,29 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/ethereum-optimism/optimism/op-chain-ops/devkeys"
+	challengerConfig "github.com/ethereum-optimism/optimism/op-challenger/config"
 	"github.com/ethereum-optimism/optimism/op-core/forks"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl"
 	"github.com/ethereum-optimism/optimism/op-devstack/dsl/proofs"
-	"github.com/ethereum-optimism/optimism/op-devstack/shim"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack"
-	"github.com/ethereum-optimism/optimism/op-devstack/stack/match"
+	"github.com/ethereum-optimism/optimism/op-devstack/dsl/zkproposer"
 	"github.com/ethereum-optimism/optimism/op-devstack/sysgo"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/intentbuilder"
+	"github.com/ethereum-optimism/optimism/op-service/clock"
 )
 
 type SingleChainInterop struct {
-	Log    log.Logger
-	T      devtest.T
-	system stack.ExtensibleSystem
+	Log        log.Logger
+	T          devtest.T
+	timeTravel *clock.AdvancingClock
+	l1Proposer *dsl.EOA
 
-	Supervisor    *dsl.Supervisor
+	SuperRoots    dsl.SuperRootSource
 	TestSequencer *dsl.TestSequencer
-	ControlPlane  stack.ControlPlane
 
 	L1Network *dsl.L1Network
 	L1EL      *dsl.L1ELNode
+	L1CL      *dsl.L1CLNode
 
 	L2ChainA   *dsl.L2Network
 	L2BatcherA *dsl.L2Batcher
@@ -36,46 +37,13 @@ type SingleChainInterop struct {
 
 	Wallet *dsl.HDWallet
 
-	FaucetA  *dsl.Faucet
-	FaucetL1 *dsl.Faucet
-	FunderL1 *dsl.Funder
-	FunderA  *dsl.Funder
-}
+	FunderL1 *dsl.FunderEOA
+	FunderA  *dsl.FunderEOA
 
-func NewSingleChainInterop(t devtest.T) *SingleChainInterop {
-	system := shim.NewSystem(t)
-	orch := Orchestrator()
-	orch.Hydrate(system)
-
-	// At this point, any supervisor is acceptable but as the DSL gets fleshed out this should be selecting supervisors
-	// that fit with specific networks and nodes. That will likely require expanding the metadata exposed by the system
-	// since currently there's no way to tell which nodes are using which supervisor.
-	t.Gate().GreaterOrEqual(len(system.Supervisors()), 1, "expected at least one supervisor")
-
-	t.Gate().Equal(len(system.TestSequencers()), 1, "expected exactly one test sequencer")
-
-	l1Net := system.L1Network(match.FirstL1Network)
-	l2A := system.L2Network(match.Assume(t, match.L2ChainA))
-	out := &SingleChainInterop{
-		Log:           t.Logger(),
-		T:             t,
-		system:        system,
-		TestSequencer: dsl.NewTestSequencer(system.TestSequencer(match.Assume(t, match.FirstTestSequencer))),
-		Supervisor:    dsl.NewSupervisor(system.Supervisor(match.Assume(t, match.FirstSupervisor)), orch.ControlPlane()),
-		ControlPlane:  orch.ControlPlane(),
-		L1Network:     dsl.NewL1Network(l1Net),
-		L1EL:          dsl.NewL1ELNode(l1Net.L1ELNode(match.Assume(t, match.FirstL1EL))),
-		L2ChainA:      dsl.NewL2Network(l2A, orch.ControlPlane()),
-		L2ELA:         dsl.NewL2ELNode(l2A.L2ELNode(match.Assume(t, match.FirstL2EL)), orch.ControlPlane()),
-		L2CLA:         dsl.NewL2CLNode(l2A.L2CLNode(match.Assume(t, match.FirstL2CL)), orch.ControlPlane()),
-		Wallet:        dsl.NewRandomHDWallet(t, 30), // Random for test isolation
-		FaucetA:       dsl.NewFaucet(l2A.Faucet(match.Assume(t, match.FirstFaucet))),
-		L2BatcherA:    dsl.NewL2Batcher(l2A.L2Batcher(match.Assume(t, match.FirstL2Batcher))),
-	}
-	out.FaucetL1 = dsl.NewFaucet(out.L1Network.Escape().Faucet(match.Assume(t, match.FirstFaucet)))
-	out.FunderL1 = dsl.NewFunder(out.Wallet, out.FaucetL1, out.L1EL)
-	out.FunderA = dsl.NewFunder(out.Wallet, out.FaucetA, out.L2ELA)
-	return out
+	// May be nil if not using sysgo
+	challengerConfig              *challengerConfig.Config
+	zkChallengerSuperRootRPCProxy *sysgo.StallableProxy
+	sysgoRuntime                  *sysgo.MultiChainRuntime
 }
 
 func (s *SingleChainInterop) L2Networks() []*dsl.L2Network {
@@ -84,15 +52,37 @@ func (s *SingleChainInterop) L2Networks() []*dsl.L2Network {
 	}
 }
 
-func (s *SingleChainInterop) AdvanceTime(amount time.Duration) {
-	ttSys, ok := s.system.(stack.TimeTravelSystem)
-	s.T.Require().True(ok, "attempting to advance time on incompatible system")
-	ttSys.AdvanceTime(amount)
+func (s *SingleChainInterop) DisputeGameFactory() *proofs.DisputeGameFactory {
+	s.T.Require().NotNil(s.SuperRoots, "supernode not configured for this preset")
+	return proofs.NewDisputeGameFactory(s.T, s.L1Network, s.L1EL.EthClient(), s.L2ChainA.DisputeGameFactoryProxyAddr(), nil, nil, s.SuperRoots, s.l1Proposer, s.challengerConfig)
 }
 
-// WithSingleChainInterop specifies a system that meets the SingleChainInterop criteria.
-func WithSingleChainInterop() stack.CommonOption {
-	return stack.MakeCommon(sysgo.DefaultSingleChainInteropSystem(&sysgo.DefaultSingleChainInteropSystemIDs{}))
+func (s *SingleChainInterop) AnchorStateRegistry(l2Chain *dsl.L2Network) *dsl.AnchorStateRegistry {
+	return dsl.NewAnchorStateRegistry(s.T, l2Chain, s.L1EL)
+}
+
+func (s *SingleChainInterop) AdvanceTime(amount time.Duration) {
+	s.T.Require().NotNil(s.timeTravel, "attempting to advance time on incompatible system")
+	s.L1EL.AdvanceTime(s.timeTravel, amount)
+}
+
+// StartZKProposer starts the kona-sp1-proposer after a system configured with
+// WithZK and WithoutHonestProposer has seeded its initial dispute games.
+func (s *SingleChainInterop) StartZKProposer() *zkproposer.ZKProposer {
+	s.T.Require().NotNil(s.sysgoRuntime, "ZK proposer controls require a sysgo-backed preset")
+	return zkproposer.New(s.T, s.sysgoRuntime.StartZKProposer(s.T))
+}
+
+// ZKChallengerSuperRootRPCProxy returns the proxy in front of the live ZK
+// challenger's super-root RPC.
+func (s *SingleChainInterop) ZKChallengerSuperRootRPCProxy() *sysgo.StallableProxy {
+	s.T.Require().NotNil(s.zkChallengerSuperRootRPCProxy,
+		"ZK challenger super-root RPC proxy is not configured")
+	return s.zkChallengerSuperRootRPCProxy
+}
+
+func (s *SingleChainInterop) proofValidationContext() (devtest.T, *dsl.L1ELNode, []*dsl.L2Network) {
+	return s.T, s.L1EL, []*dsl.L2Network{s.L2ChainA}
 }
 
 type SimpleInterop struct {
@@ -103,8 +93,7 @@ type SimpleInterop struct {
 	L2ELB      *dsl.L2ELNode
 	L2CLB      *dsl.L2CLNode
 
-	FaucetB *dsl.Faucet
-	FunderB *dsl.Funder
+	FunderB *dsl.FunderEOA
 }
 
 func (s *SimpleInterop) L2Networks() []*dsl.L2Network {
@@ -113,146 +102,122 @@ func (s *SimpleInterop) L2Networks() []*dsl.L2Network {
 	}
 }
 
-func (s *SimpleInterop) DisputeGameFactory() *proofs.DisputeGameFactory {
-	return proofs.NewDisputeGameFactory(s.T, s.L1Network, s.L1EL.EthClient(), s.L2ChainA.DisputeGameFactoryProxyAddr(), nil, nil, s.Supervisor, nil)
+func (s *SimpleInterop) proofValidationContext() (devtest.T, *dsl.L1ELNode, []*dsl.L2Network) {
+	return s.T, s.L1EL, s.L2Networks()
+}
+
+// Supernode returns the op-supernode backing this system's super roots. SimpleInterop
+// is always supernode-backed, so this exposes supernode-only test controls (e.g.
+// interop pause/resume) that are not part of the SuperRootSource interface.
+func (s *SimpleInterop) Supernode() *dsl.Supernode {
+	sn, ok := s.SuperRoots.(*dsl.Supernode)
+	s.T.Require().True(ok, "SimpleInterop super roots are not supernode-backed")
+	return sn
 }
 
 func (s *SingleChainInterop) StandardBridge(l2Chain *dsl.L2Network) *dsl.StandardBridge {
-	return dsl.NewStandardBridge(s.T, l2Chain, s.Supervisor, s.L1EL)
+	return dsl.NewStandardBridge(s.T, l2Chain, s.L1EL)
 }
 
-// WithSimpleInterop specifies a system that meets the SimpleInterop criteria.
-func WithSimpleInterop() stack.CommonOption {
-	return stack.MakeCommon(sysgo.DefaultInteropSystem(&sysgo.DefaultInteropSystemIDs{}))
+// NewSimpleInterop creates a fresh SimpleInterop target for the current
+// test using the super-root proofs system backed by op-supernode.
+func NewSimpleInterop(t devtest.T, opts ...Option) *SimpleInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSimpleInterop", opts, twoL2SupernodeProofsPresetSupportedOptionKinds)
+	return simpleInteropFromSupernodeProofsRuntime(t, sysgo.NewTwoL2SupernodeProofsRuntimeWithConfig(t, true, presetCfg))
 }
 
-// WithSuperInterop specifies a super root system that meets the SimpleInterop criteria.
-func WithSuperInterop() stack.CommonOption {
-	return stack.MakeCommon(sysgo.DefaultInteropProofsSystem(&sysgo.DefaultInteropSystemIDs{}))
+// NewSingleChainInterop creates a fresh SingleChainInterop target for the
+// current test using the single-chain super-root proofs system backed by op-supernode.
+func NewSingleChainInterop(t devtest.T, opts ...Option) *SingleChainInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSingleChainInterop", opts, supernodeProofsPresetSupportedOptionKinds)
+	return singleChainInteropFromSupernodeProofsRuntime(t, sysgo.NewSingleChainSupernodeProofsRuntimeWithConfig(t, true, presetCfg))
 }
 
-func WithIsthmusSuper() stack.CommonOption {
-	return stack.MakeCommon(sysgo.DefaultIsthmusSuperProofsSystem(&sysgo.DefaultInteropSystemIDs{}))
+// NewSimpleInteropIsthmusSuper creates a fresh SimpleInterop target for the current test
+// using the Isthmus super-root system backed by op-supernode.
+func NewSimpleInteropIsthmusSuper(t devtest.T, opts ...Option) *SimpleInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSimpleInteropIsthmusSuper", opts, twoL2SupernodeProofsPresetSupportedOptionKinds)
+	return simpleInteropFromSupernodeProofsRuntime(t, sysgo.NewTwoL2SupernodeProofsRuntimeWithConfig(t, false, presetCfg))
 }
 
-// WithUnscheduledInterop adds a test-gate to not run the test if the interop upgrade is scheduled.
-// If the backend is sysgo, it will disable the interop configuration
-func WithUnscheduledInterop() stack.CommonOption {
-	return stack.Combine(
-		stack.MakeCommon(sysgo.WithDeployerOptions(func(p devtest.P, keys devkeys.Keys, builder intentbuilder.Builder) {
-			for _, l2 := range builder.L2s() {
-				l2.WithForkAtOffset(forks.Interop, nil)
-			}
-		})),
-		stack.PostHydrate[stack.Orchestrator](func(sys stack.System) {
-			for _, l2Net := range sys.L2Networks() {
-				sys.T().Gate().Nil(l2Net.ChainConfig().InteropTime, "L2 (%s) must not have scheduled interop in chain config", l2Net.ID())
-				sys.T().Gate().Nil(l2Net.RollupConfig().InteropTime, "L2 (%s) must not have scheduled interop in rollup config", l2Net.ID())
-			}
-		}),
-	)
+// NewSingleChainInteropIsthmusSuper creates a fresh SingleChainInterop target for the
+// current test using the single-chain Isthmus super-root system backed by op-supernode.
+func NewSingleChainInteropIsthmusSuper(t devtest.T, opts ...Option) *SingleChainInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSingleChainInteropIsthmusSuper", opts, supernodeProofsPresetSupportedOptionKinds)
+	return singleChainInteropFromSupernodeProofsRuntime(t, sysgo.NewSingleChainSupernodeProofsRuntimeWithConfig(t, false, presetCfg))
 }
 
-func NewSimpleInterop(t devtest.T) *SimpleInterop {
-	singleChain := NewSingleChainInterop(t)
-	orch := Orchestrator()
-	l2B := singleChain.system.L2Network(match.Assume(t, match.L2ChainB))
-	out := &SimpleInterop{
-		SingleChainInterop: *singleChain,
-		L2ChainB:           dsl.NewL2Network(l2B, orch.ControlPlane()),
-		L2ELB:              dsl.NewL2ELNode(l2B.L2ELNode(match.Assume(t, match.FirstL2EL)), orch.ControlPlane()),
-		L2CLB:              dsl.NewL2CLNode(l2B.L2CLNode(match.Assume(t, match.FirstL2CL)), orch.ControlPlane()),
-		FaucetB:            dsl.NewFaucet(l2B.Faucet(match.Assume(t, match.FirstFaucet))),
-		L2BatcherB:         dsl.NewL2Batcher(l2B.L2Batcher(match.Assume(t, match.FirstL2Batcher))),
-	}
-	out.FunderB = dsl.NewFunder(out.Wallet, out.FaucetB, out.L2ELB)
-	return out
+// NewSingleChainInteropNoSupernode creates a fresh SingleChainInterop target whose
+// super roots are served by the single op-node's superroot_atTimestamp endpoint (no
+// op-supernode). The op-challenger plays super-cannon-kona games against this op-node
+// source. This exercises the "op-node as super root RPC" path end-to-end.
+func NewSingleChainInteropNoSupernode(t devtest.T, opts ...Option) *SingleChainInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSingleChainInteropNoSupernode", opts, singleChainInteropNoSupernodePresetSupportedOptionKinds)
+	return singleChainInteropNoSupernodeFromRuntime(t, sysgo.NewSingleChainInteropNoSupernodeSuperRootRuntimeWithConfig(t, presetCfg))
 }
 
-// WithSuggestedInteropActivationOffset suggests a hardfork time offset to use.
+// NewSingleChainInteropNoSupernodeZKDispute creates a fresh SingleChainInterop target whose super
+// roots are served by the single op-node's superroot_atTimestamp endpoint (no op-supernode),
+// running an op-challenger that plays ZK dispute games against that op-node source. This exercises
+// the "op-node as super root RPC" path for the ZK game end-to-end.
+func NewSingleChainInteropNoSupernodeZKDispute(t devtest.T, opts ...Option) *SingleChainInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSingleChainInteropNoSupernodeZKDispute", opts, 0)
+	return singleChainInteropNoSupernodeFromRuntime(t, sysgo.NewSingleChainInteropNoSupernodeZKDisputeRuntimeWithConfig(t, presetCfg))
+}
+
+// NewSingleChainInteropSuperRootAtGenesis creates a fresh SingleChainInterop
+// target where SuperPermissionedDisputeGame is installed in the permissioned
+// slot as part of the initial op-deployer apply - no post-deploy OPCMv2
+// migration runs. This exercises the initial-deploy path for super-root
+// dispute games tracked by ethereum-optimism/optimism#18729.
+func NewSingleChainInteropSuperRootAtGenesis(t devtest.T, opts ...Option) *SingleChainInterop {
+	presetCfg, _ := collectSupportedPresetConfig(t, "NewSingleChainInteropSuperRootAtGenesis", opts, supernodeProofsPresetSupportedOptionKinds)
+	return singleChainInteropFromSupernodeProofsRuntime(t, sysgo.NewSingleChainSuperRootAtGenesisRuntimeWithConfig(t, presetCfg))
+}
+
+// WithSuggestedLagoonActivationOffset suggests a Lagoon hardfork time offset to use.
 // This is applied e.g. to the deployment if running against sysgo.
-func WithSuggestedInteropActivationOffset(offset uint64) stack.CommonOption {
-	return stack.MakeCommon(sysgo.WithDeployerOptions(
-		func(p devtest.P, keys devkeys.Keys, builder intentbuilder.Builder) {
+func WithSuggestedLagoonActivationOffset(offset uint64) Option {
+	return WithDeployerOptions(
+		func(p devtest.T, keys devkeys.Keys, builder intentbuilder.Builder) {
 			for _, l2Cfg := range builder.L2s() {
-				l2Cfg.WithForkAtOffset(forks.Interop, &offset)
+				l2Cfg.WithForkAtOffset(forks.Lagoon, &offset)
 			}
 		},
-	))
+	)
 }
 
 // WithSequencingWindow suggests a sequencing window to use, and checks the maximum sequencing window.
 // The sequencing windows are expressed in number of L1 execution-layer blocks till sequencing window expiry.
-// This is applied e.g. to the chain configuration setup if running against sysgo.
-func WithSequencingWindow(suggestedSequencingWindow uint64, maxSequencingWindow uint64) stack.CommonOption {
-	return stack.Combine(
-		stack.MakeCommon(sysgo.WithDeployerOptions(
-			sysgo.WithSequencingWindow(suggestedSequencingWindow),
-		)),
-		// We can't configure sysext sequencing window, so we go with whatever is configured.
-		// The post-hydrate function will check that the sequencing window is within expected bounds.
-		stack.PostHydrate[stack.Orchestrator](func(sys stack.System) {
-			for _, l2Net := range sys.L2Networks() {
-				cfg := l2Net.RollupConfig()
-				l2Net.T().Gate().LessOrEqual(cfg.SeqWindowSize, maxSequencingWindow,
-					"sequencing window of chain %s must fit in max sequencing window size", l2Net.ChainID())
-			}
-		}),
-	)
+// This is applied to runtime deployment/config validation.
+func WithSequencingWindow(suggestedSequencingWindow uint64, maxSequencingWindow uint64) Option {
+	return option{
+		kinds: optionKindDeployer | optionKindMaxSequencingWindow,
+		applyFn: func(cfg *sysgo.PresetConfig) {
+			cfg.DeployerOptions = append(cfg.DeployerOptions, sysgo.WithSequencingWindow(suggestedSequencingWindow))
+			v := maxSequencingWindow
+			cfg.MaxSequencingWindow = &v
+		},
+	}
 }
 
 // WithInteropNotAtGenesis adds a test-gate that checks
 // if the interop hardfork is configured at a non-genesis time.
-func WithInteropNotAtGenesis() stack.CommonOption {
-	return stack.PostHydrate[stack.Orchestrator](func(sys stack.System) {
-		for _, l2Net := range sys.L2Networks() {
-			interopTime := l2Net.ChainConfig().InteropTime
-			sys.T().Gate().NotNil(interopTime, "must have interop")
-			sys.T().Gate().NotZero(*interopTime, "must not be at genesis")
-		}
-	})
+func WithInteropNotAtGenesis() Option {
+	return WithRequireInteropNotAtGenesis()
 }
 
-func WithL2NetworkCount(count int) stack.CommonOption {
-	return stack.PostHydrate[stack.Orchestrator](func(sys stack.System) {
-		sys.T().Gate().Lenf(sys.L2Networks(), count, "Must have exactly %v chains", count)
-	})
+// MinimalInteropNoSupernode is like Minimal but with interop contracts deployed.
+// No supernode is running - this tests interop contract deployment with local finality.
+type MinimalInteropNoSupernode struct {
+	Minimal
 }
 
-type MultiSupervisorInterop struct {
-	SimpleInterop
-
-	// Supervisor does not support multinode so need a additional supervisor for verifier nodes
-	SupervisorSecondary *dsl.Supervisor
-
-	L2ELA2 *dsl.L2ELNode
-	L2CLA2 *dsl.L2CLNode
-	L2ELB2 *dsl.L2ELNode
-	L2CLB2 *dsl.L2CLNode
-}
-
-func WithMultiSupervisorInterop() stack.CommonOption {
-	return stack.MakeCommon(sysgo.MultiSupervisorInteropSystem(&sysgo.MultiSupervisorInteropSystemIDs{}))
-}
-
-// NewMultiSupervisorInterop initializes below scenario:
-// Two supervisor initialized, each managing two L2CLs per chains.
-// Primary supervisor manages sequencer L2CLs for chain A, B.
-// Secondary supervisor manages verifier L2CLs for chain A, B.
-// Each L2CLs per chain is connected via P2P.
-func NewMultiSupervisorInterop(t devtest.T) *MultiSupervisorInterop {
-	simpleInterop := NewSimpleInterop(t)
-	orch := Orchestrator()
-
-	l2A := simpleInterop.system.L2Network(match.Assume(t, match.L2ChainA))
-	l2B := simpleInterop.system.L2Network(match.Assume(t, match.L2ChainB))
-	out := &MultiSupervisorInterop{
-		SimpleInterop:       *simpleInterop,
-		SupervisorSecondary: dsl.NewSupervisor(simpleInterop.system.Supervisor(match.Assume(t, match.SecondSupervisor)), orch.ControlPlane()),
-		L2ELA2:              dsl.NewL2ELNode(l2A.L2ELNode(match.Assume(t, match.SecondL2EL)), orch.ControlPlane()),
-		L2CLA2:              dsl.NewL2CLNode(l2A.L2CLNode(match.Assume(t, match.SecondL2CL)), orch.ControlPlane()),
-		L2ELB2:              dsl.NewL2ELNode(l2B.L2ELNode(match.Assume(t, match.SecondL2EL)), orch.ControlPlane()),
-		L2CLB2:              dsl.NewL2CLNode(l2B.L2CLNode(match.Assume(t, match.SecondL2CL)), orch.ControlPlane()),
+// NewMinimalInteropNoSupernode creates a fresh MinimalInteropNoSupernode target for the
+// current test.
+func NewMinimalInteropNoSupernode(t devtest.T, opts ...Option) *MinimalInteropNoSupernode {
+	_, _ = collectSupportedPresetConfig(t, "NewMinimalInteropNoSupernode", opts, 0)
+	return &MinimalInteropNoSupernode{
+		Minimal: *minimalFromRuntime(t, sysgo.NewMinimalInteropNoSupernodeRuntime(t)),
 	}
-	return out
 }

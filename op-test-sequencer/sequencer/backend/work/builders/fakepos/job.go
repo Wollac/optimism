@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/geth"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	opeth "github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/testutils"
@@ -82,14 +84,14 @@ func (j *Job) setHeadSafeAndFinalized() {
 		j.safe = j.finalized
 	}
 
-	if j.head.Number.Uint64() > j.b.finalizedDistance { // progress finalized block, if we can
-		j.finalized, err = j.b.blockchain.HeaderByNumber(context.Background(), new(big.Int).SetUint64(j.head.Number.Uint64()-j.b.finalizedDistance))
+	if bigs.Uint64Strict(j.head.Number) > j.b.finalizedDistance { // progress finalized block, if we can
+		j.finalized, err = j.b.blockchain.HeaderByNumber(context.Background(), new(big.Int).SetUint64(bigs.Uint64Strict(j.head.Number)-j.b.finalizedDistance))
 		if err != nil {
 			panic("no block found finalizedDistance behind head")
 		}
 	}
-	if j.head.Number.Uint64() > j.b.safeDistance { // progress safe block, if we can
-		j.safe, err = j.b.blockchain.HeaderByNumber(context.Background(), new(big.Int).SetUint64(j.head.Number.Uint64()-j.b.safeDistance))
+	if bigs.Uint64Strict(j.head.Number) > j.b.safeDistance { // progress safe block, if we can
+		j.safe, err = j.b.blockchain.HeaderByNumber(context.Background(), new(big.Int).SetUint64(bigs.Uint64Strict(j.head.Number)-j.b.safeDistance))
 		if err != nil {
 			panic("no block found safeDistance behind head")
 		}
@@ -109,6 +111,8 @@ func (j *Job) Open(ctx context.Context) error {
 	envelope, ok := j.b.envelopes[j.head.Hash()]
 	if !ok { // we haven't build a block with this parent yet, so we need to build one
 		newBlockTime := j.head.Time + j.b.blockTime
+		nextHeight := new(big.Int).Add(j.head.Number, common.Big1)
+		isAmsterdam := j.b.config.IsAmsterdam(nextHeight, newBlockTime)
 
 		attrs := &engine.PayloadAttributes{
 			Timestamp:             newBlockTime,
@@ -117,15 +121,31 @@ func (j *Job) Open(ctx context.Context) error {
 			Withdrawals:           randomWithdrawals(j.b.withdrawalsIndex),
 			BeaconRoot:            &j.parentBeaconBlockRoot,
 		}
+		if isAmsterdam {
+			slotNumber := (newBlockTime - j.b.genesis.Time) / j.b.blockTime
+			attrs.SlotNumber = &slotNumber
+			targetGasLimit := j.head.GasLimit
+			attrs.TargetGasLimit = &targetGasLimit
+		}
 		fcState := engine.ForkchoiceStateV1{
 			HeadBlockHash:      j.head.Hash(),
 			SafeBlockHash:      j.safe.Hash(),
 			FinalizedBlockHash: j.finalized.Hash(),
 		}
-		j.logger.Info("ForkchoiceUpdatedV3", "fcState", fcState)
-
-		res, err := j.b.engine.ForkchoiceUpdatedV3(fcState, attrs)
+		var res engine.ForkChoiceResponse
+		var err error
+		if isAmsterdam {
+			j.logger.Info("ForkchoiceUpdatedV4", "fcState", fcState)
+			res, err = j.b.engine.ForkchoiceUpdatedV4(ctx, fcState, attrs, nil)
+		} else {
+			j.logger.Info("ForkchoiceUpdatedV3", "fcState", fcState)
+			res, err = j.b.engine.ForkchoiceUpdatedV3(ctx, fcState, attrs)
+		}
 		if err != nil {
+			j.logger.Error("failed to start building L1 block", "err", err)
+			return err
+		}
+		if err := geth.ValidatePayloadStatus("start-building forkchoice update", res.PayloadStatus); err != nil {
 			j.logger.Error("failed to start building L1 block", "err", err)
 			return err
 		}
@@ -139,15 +159,24 @@ func (j *Job) Open(ctx context.Context) error {
 		// wait for the block building to finish
 		time.Sleep(100 * time.Millisecond)
 
-		envelope, err = j.b.engine.GetPayloadV4(*res.PayloadID)
+		if isAmsterdam {
+			envelope, err = j.b.engine.GetPayloadV6(*res.PayloadID)
+		} else if j.b.config.IsOsaka(nextHeight, newBlockTime) {
+			envelope, err = j.b.engine.GetPayloadV5(*res.PayloadID)
+		} else {
+			envelope, err = j.b.engine.GetPayloadV4(*res.PayloadID)
+		}
 		if err != nil {
 			j.logger.Error("failed to finish building L1 block", "err", err)
 			return err
 		}
+		if isAmsterdam {
+			geth.EnsureAmsterdamBlockAccessList(envelope.ExecutionPayload)
+		}
 
 		j.b.envelopes[envelope.ExecutionPayload.ParentHash] = envelope
 	} else {
-		j.logger.Warn("already had a block with that parent", "parent", j.head.Hash(), "number", j.head.Number.Uint64(), "fee_recipient", envelope.ExecutionPayload.FeeRecipient)
+		j.logger.Warn("already had a block with that parent", "parent", j.head.Hash(), "number", j.head.Number, "fee_recipient", envelope.ExecutionPayload.FeeRecipient)
 
 		j.logger.Warn("updating block hash", "pre", envelope.ExecutionPayload.BlockHash, "fee_recipient", envelope.ExecutionPayload.FeeRecipient, "txs", len(envelope.ExecutionPayload.Transactions))
 
@@ -195,8 +224,20 @@ func (j *Job) Seal(ctx context.Context) (work.Block, error) {
 
 	j.logger.Info("about to insert payload into the chain", "envelope-hash", envelope.ExecutionPayload.BlockHash, "txs", len(envelope.ExecutionPayload.Transactions))
 
-	_, err := j.b.engine.NewPayloadV4(*envelope.ExecutionPayload, blobHashes, &j.parentBeaconBlockRoot, make([]hexutil.Bytes, 0))
+	var err error
+	var payloadStatus engine.PayloadStatusV1
+	payloadNumber := new(big.Int).SetUint64(envelope.ExecutionPayload.Number)
+	isAmsterdam := j.b.config.IsAmsterdam(payloadNumber, envelope.ExecutionPayload.Timestamp)
+	if isAmsterdam {
+		payloadStatus, err = j.b.engine.NewPayloadV5(ctx, *envelope.ExecutionPayload, blobHashes, &j.parentBeaconBlockRoot, make([]hexutil.Bytes, 0))
+	} else {
+		payloadStatus, err = j.b.engine.NewPayloadV4(ctx, *envelope.ExecutionPayload, blobHashes, &j.parentBeaconBlockRoot, make([]hexutil.Bytes, 0))
+	}
 	if err != nil {
+		j.logger.Error("failed to insert built L1 block", "err", err)
+		return nil, err
+	}
+	if err := geth.ValidatePayloadStatus("new payload", payloadStatus); err != nil {
 		j.logger.Error("failed to insert built L1 block", "err", err)
 		return nil, err
 	}
@@ -215,11 +256,22 @@ func (j *Job) Seal(ctx context.Context) (work.Block, error) {
 
 	j.logger.Info("about to forkchoice update", "safe", j.safe.Hash(), "finalized", j.finalized.Hash(), "head", envelope.ExecutionPayload.BlockHash)
 
-	if _, err := j.b.engine.ForkchoiceUpdatedV3(engine.ForkchoiceStateV1{
+	fcState := engine.ForkchoiceStateV1{
 		HeadBlockHash:      envelope.ExecutionPayload.BlockHash,
 		SafeBlockHash:      j.safe.Hash(),
 		FinalizedBlockHash: j.finalized.Hash(),
-	}, nil); err != nil {
+	}
+	var fcRes engine.ForkChoiceResponse
+	if isAmsterdam {
+		fcRes, err = j.b.engine.ForkchoiceUpdatedV4(ctx, fcState, nil, nil)
+	} else {
+		fcRes, err = j.b.engine.ForkchoiceUpdatedV3(ctx, fcState, nil)
+	}
+	if err != nil {
+		j.logger.Error("failed to make built L1 block canonical", "err", err)
+		return nil, err
+	}
+	if err := geth.ValidatePayloadStatus("canonicalizing forkchoice update", fcRes.PayloadStatus); err != nil {
 		j.logger.Error("failed to make built L1 block canonical", "err", err)
 		return nil, err
 	}

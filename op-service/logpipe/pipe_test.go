@@ -15,14 +15,14 @@ import (
 func TestWriteToLogProcessor(t *testing.T) {
 	logger, capt := testlog.CaptureLogger(t, log.LevelTrace)
 
-	logProc := LogProcessor(func(line []byte) {
+	proc := NewLineBuffer(func(line []byte) {
 		ToLogger(logger)(ParseRustStructuredLogs(line))
 	})
-	_, err := io.Copy(logProc, strings.NewReader(`{"level": "DEBUG", "fields": {"message": "hello", "foo": 1}}`+"\n"))
+	_, err := io.Copy(proc, strings.NewReader(`{"level": "DEBUG", "fields": {"message": "hello", "foo": 1}}`+"\n"))
 	require.NoError(t, err)
-	_, err = io.Copy(logProc, strings.NewReader(`test invalid JSON`+"\n"))
+	_, err = io.Copy(proc, strings.NewReader(`test invalid JSON`+"\n"))
 	require.NoError(t, err)
-	_, err = io.Copy(logProc, strings.NewReader(`{"fields": {"message": "world", "bar": "sunny"}, "level": "INFO"}`+"\n"))
+	_, err = io.Copy(proc, strings.NewReader(`{"fields": {"message": "world", "bar": "sunny"}, "level": "INFO"}`+"\n"))
 	require.NoError(t, err)
 
 	entry1 := capt.FindLog(
@@ -42,4 +42,57 @@ func TestWriteToLogProcessor(t *testing.T) {
 		testlog.NewAttributesContainsFilter("bar", "sunny"))
 	require.NotNil(t, entry3)
 	require.Equal(t, "world", entry3.Message)
+}
+
+func TestWriteToLogProcessorWithMinLevel(t *testing.T) {
+	logger, capt := testlog.CaptureLogger(t, log.LevelTrace)
+
+	proc := NewLineBuffer(func(line []byte) {
+		ToLoggerWithMinLevel(logger, log.LevelWarn)(ParseRustStructuredLogs(line))
+	})
+	_, err := io.Copy(proc, strings.NewReader(`{"level": "DEBUG", "fields": {"message": "hello", "foo": 1}}`+"\n"))
+	require.NoError(t, err)
+	_, err = io.Copy(proc, strings.NewReader(`{"fields": {"message": "world", "bar": "sunny"}, "level": "INFO"}`+"\n"))
+	require.NoError(t, err)
+	_, err = io.Copy(proc, strings.NewReader(`{"fields": {"message": "warn", "baz": "kept"}, "level": "WARN"}`+"\n"))
+	require.NoError(t, err)
+
+	require.Nil(t, capt.FindLog(
+		testlog.NewLevelFilter(log.LevelDebug),
+		testlog.NewAttributesContainsFilter("foo", "1")))
+	require.Nil(t, capt.FindLog(
+		testlog.NewLevelFilter(log.LevelInfo),
+		testlog.NewAttributesContainsFilter("bar", "sunny")))
+
+	entry := capt.FindLog(
+		testlog.NewLevelFilter(log.LevelWarn),
+		testlog.NewAttributesContainsFilter("baz", "kept"))
+	require.NotNil(t, entry)
+	require.Equal(t, "warn", entry.Message)
+}
+
+func TestWriteToLogProcessorRaisedToLevel(t *testing.T) {
+	logger, capt := testlog.CaptureLogger(t, log.LevelTrace)
+
+	proc := NewLineBuffer(func(line []byte) {
+		ToLoggerRaisedToLevel(logger, log.LevelInfo)(ParseRustStructuredLogs(line))
+	})
+	_, err := io.Copy(proc, strings.NewReader(`{"level": "DEBUG", "fields": {"message": "hello", "foo": 1}}`+"\n"))
+	require.NoError(t, err)
+	_, err = io.Copy(proc, strings.NewReader(`{"fields": {"message": "world", "bar": "sunny"}, "level": "WARN"}`+"\n"))
+	require.NoError(t, err)
+
+	// Below-min entries are raised to the min level, keeping the original level as attribute.
+	entry1 := capt.FindLog(
+		testlog.NewLevelFilter(log.LevelInfo),
+		testlog.NewAttributesContainsFilter("innerLevel", "DEBUG"))
+	require.NotNil(t, entry1)
+	require.Equal(t, "hello", entry1.Message)
+
+	// Entries at or above the min level are passed through unchanged.
+	entry2 := capt.FindLog(
+		testlog.NewLevelFilter(log.LevelWarn),
+		testlog.NewAttributesContainsFilter("bar", "sunny"))
+	require.NotNil(t, entry2)
+	require.Equal(t, "world", entry2.Message)
 }

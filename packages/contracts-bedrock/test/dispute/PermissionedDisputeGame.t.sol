@@ -3,12 +3,12 @@ pragma solidity ^0.8.15;
 
 // Testing
 import { DisputeGameFactory_TestInit } from "test/dispute/DisputeGameFactory.t.sol";
+import { _changeClaimStatus, _dummyClaim } from "test/dispute/FaultDisputeGame.t.sol";
 import { AlphabetVM } from "test/mocks/AlphabetVM.sol";
 
 // Libraries
 import "src/dispute/lib/Types.sol";
 import "src/dispute/lib/Errors.sol";
-import { DevFeatures } from "src/libraries/DevFeatures.sol";
 
 // Interfaces
 import { IFaultDisputeGame } from "interfaces/dispute/IFaultDisputeGame.sol";
@@ -38,7 +38,7 @@ abstract contract PermissionedDisputeGame_TestInit is DisputeGameFactory_TestIni
     /// @notice The root claim of the game.
     Claim internal rootClaim;
     /// @notice An arbitrary root claim for testing.
-    Claim internal arbitaryRootClaim = Claim.wrap(bytes32(uint256(123)));
+    Claim internal arbitraryRootClaim = Claim.wrap(bytes32(uint256(123)));
     /// @notice Minimum bond value that covers all possible moves.
     uint256 internal constant MIN_BOND = 50 ether;
 
@@ -53,7 +53,7 @@ abstract contract PermissionedDisputeGame_TestInit is DisputeGameFactory_TestIni
 
     function init(Claim _rootClaim, Claim _absolutePrestate, uint256 _l2BlockNumber) public {
         // Set the time to a realistic date.
-        if (!isForkTest()) {
+        if (!isL1ForkTest()) {
             vm.warp(1690906994);
         }
 
@@ -110,23 +110,11 @@ abstract contract PermissionedDisputeGame_TestInit is DisputeGameFactory_TestIni
         init({ _rootClaim: rootClaim, _absolutePrestate: absolutePrestate, _l2BlockNumber: validL2BlockNumber });
     }
 
-    /// @dev Helper to return a pseudo-random claim
-    function _dummyClaim() internal view returns (Claim) {
-        return Claim.wrap(keccak256(abi.encode(gasleft())));
-    }
-
     /// @dev Helper to get the required bond for the given claim index.
     function _getRequiredBond(uint256 _claimIndex) internal view returns (uint256 bond_) {
         (,,,,, Position parent,) = gameProxy.claimData(_claimIndex);
         Position pos = parent.move(true);
         bond_ = gameProxy.getRequiredBond(pos);
-    }
-
-    /// @dev Helper to change the VM status byte of a claim.
-    function _changeClaimStatus(Claim _claim, VMStatus _status) internal pure returns (Claim out_) {
-        assembly {
-            out_ := or(and(not(shl(248, 0xFF)), _claim), shl(248, _status))
-        }
     }
 
     fallback() external payable { }
@@ -286,8 +274,7 @@ contract PermissionedDisputeGame_Initialize_Test is PermissionedDisputeGame_Test
     /// @notice Tests that the game cannot be initialized with incorrect CWIA calldata length
     ///         caused by additional immutable args data
     function test_initialize_extraImmutableArgsBytes_reverts(uint256 _extraByteCount) public {
-        skipIfDevFeatureDisabled(DevFeatures.DEPLOY_V2_DISPUTE_GAMES);
-        (bytes memory correctArgs,,) = getPermissionedDisputeGameV2ImmutableArgs(absolutePrestate, PROPOSER, CHALLENGER);
+        (bytes memory correctArgs,,) = getPermissionedDisputeGameImmutableArgs(absolutePrestate, PROPOSER, CHALLENGER);
 
         // We bound the upper end to 23.5KB to ensure that the minimal proxy never surpasses the
         // contract size limit in this test, as CWIA proxies store the immutable args in their
@@ -298,7 +285,7 @@ contract PermissionedDisputeGame_Initialize_Test is PermissionedDisputeGame_Test
         copyBytes(correctArgs, immutableArgs);
 
         // Set up dispute game implementation with target immutableArgs
-        setupPermissionedDisputeGameV2(immutableArgs);
+        setupPermissionedDisputeGame(immutableArgs);
 
         Claim claim = _dummyClaim();
         vm.prank(PROPOSER, PROPOSER);
@@ -313,8 +300,7 @@ contract PermissionedDisputeGame_Initialize_Test is PermissionedDisputeGame_Test
     /// @notice Tests that the game cannot be initialized with incorrect CWIA calldata length
     ///         caused by missing immutable args data
     function test_initialize_missingImmutableArgsBytes_reverts(uint256 _truncatedByteCount) public {
-        skipIfDevFeatureDisabled(DevFeatures.DEPLOY_V2_DISPUTE_GAMES);
-        (bytes memory correctArgs,,) = getPermissionedDisputeGameV2ImmutableArgs(absolutePrestate, PROPOSER, CHALLENGER);
+        (bytes memory correctArgs,,) = getPermissionedDisputeGameImmutableArgs(absolutePrestate, PROPOSER, CHALLENGER);
 
         _truncatedByteCount = (_truncatedByteCount % correctArgs.length) + 1;
         bytes memory immutableArgs = new bytes(correctArgs.length - _truncatedByteCount);
@@ -322,7 +308,7 @@ contract PermissionedDisputeGame_Initialize_Test is PermissionedDisputeGame_Test
         copyBytes(correctArgs, immutableArgs);
 
         // Set up dispute game implementation with target immutableArgs
-        setupPermissionedDisputeGameV2(immutableArgs);
+        setupPermissionedDisputeGame(immutableArgs);
 
         Claim claim = _dummyClaim();
         vm.prank(PROPOSER, PROPOSER);
@@ -342,7 +328,7 @@ contract PermissionedDisputeGame_Uncategorized_Test is PermissionedDisputeGame_T
     /// @notice Tests that the proposer can create a permissioned dispute game.
     function test_createGame_proposer_succeeds() public {
         vm.prank(PROPOSER, PROPOSER);
-        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitaryRootClaim, abi.encode(validL2BlockNumber));
+        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitraryRootClaim, abi.encode(validL2BlockNumber));
     }
 
     /// @notice Tests that the permissioned game cannot be created by the challenger.
@@ -350,7 +336,7 @@ contract PermissionedDisputeGame_Uncategorized_Test is PermissionedDisputeGame_T
         vm.deal(CHALLENGER, initBond);
         vm.prank(CHALLENGER, CHALLENGER);
         vm.expectRevert(BadAuth.selector);
-        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitaryRootClaim, abi.encode(validL2BlockNumber));
+        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitraryRootClaim, abi.encode(validL2BlockNumber));
     }
 
     /// @notice Tests that the permissioned game cannot be created by any address other than the
@@ -361,7 +347,7 @@ contract PermissionedDisputeGame_Uncategorized_Test is PermissionedDisputeGame_T
         vm.deal(_p, initBond);
         vm.prank(_p, _p);
         vm.expectRevert(BadAuth.selector);
-        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitaryRootClaim, abi.encode(validL2BlockNumber));
+        disputeGameFactory.create{ value: initBond }(GAME_TYPE, arbitraryRootClaim, abi.encode(validL2BlockNumber));
     }
 
     /// @notice Tests that the challenger can participate in a permissioned dispute game.
@@ -416,5 +402,21 @@ contract PermissionedDisputeGame_Uncategorized_Test is PermissionedDisputeGame_T
         vm.expectRevert(BadAuth.selector);
         gameProxy.step(0, true, absolutePrestateData, hex"");
         vm.stopPrank();
+    }
+}
+
+/// @title PermissionedDisputeGame_RootClaimByChainId_Test
+/// @notice Tests the `rootClaimByChainId` function.
+contract PermissionedDisputeGame_RootClaimByChainId_Test is PermissionedDisputeGame_TestInit {
+    /// @notice Tests that rootClaimByChainId returns the same value as rootClaim().
+    function test_rootClaimByChainId_succeeds() public view {
+        assertEq(gameProxy.rootClaimByChainId(gameProxy.l2ChainId()).raw(), gameProxy.rootClaim().raw());
+    }
+
+    /// @notice Tests that rootClaimByChainId reverts with unknown chain ID.
+    function test_rootClaimByChainId_unknownChainId_reverts(uint256 _chainId) public {
+        vm.assume(_chainId != gameProxy.l2ChainId());
+        vm.expectRevert(UnknownChainId.selector);
+        gameProxy.rootClaimByChainId(_chainId);
     }
 }

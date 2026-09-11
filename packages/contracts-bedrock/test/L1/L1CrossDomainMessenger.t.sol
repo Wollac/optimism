@@ -3,7 +3,7 @@ pragma solidity 0.8.15;
 
 // Testing utilities
 import { CommonTest } from "test/setup/CommonTest.sol";
-import { Reverter, GasBurner } from "test/mocks/Callers.sol";
+import { GasBurner } from "test/mocks/GasBurner.sol";
 import { stdError } from "forge-std/StdError.sol";
 import { ForgeArtifacts, StorageSlot } from "scripts/libraries/ForgeArtifacts.sol";
 
@@ -17,7 +17,7 @@ import { Encoding } from "src/libraries/Encoding.sol";
 import { IL1CrossDomainMessenger } from "interfaces/L1/IL1CrossDomainMessenger.sol";
 import { IOptimismPortal2 } from "interfaces/L1/IOptimismPortal2.sol";
 import { ISystemConfig } from "interfaces/L1/ISystemConfig.sol";
-import { IProxyAdminOwnedBase } from "interfaces/L1/IProxyAdminOwnedBase.sol";
+import { IProxyAdminOwnedBase } from "interfaces/universal/IProxyAdminOwnedBase.sol";
 
 /// @title L1CrossDomainMessenger_Encoding_Harness
 /// @notice A harness contract for testing internal functions of the Encoding library.
@@ -601,12 +601,8 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         // Skip if this is a fork test, won't work.
         skipIfForkTest("L2CrossDomainMessenger doesn't exist on L1 in forked test");
 
-        // Using smaller uint so the fuzzer doesn't give as many massive values that get bounded.
-        // TODO: Known issue, messages above 34k can actually OOG on the receiving side if the
-        // target uses all available gas. Can be resolved by capping data sizes on the XDM or by
-        // increasing the amount of available relay gas to ~100k. If increasing relay gas, should
-        // have the relay gas only increase when the calldata size is large to avoid disrupting
-        // in-flight L2 -> L1 messages.
+        // Keep the fuzz input bounded so the test remains fast. Near-max payloads are covered by a
+        // deterministic regression test below.
         _messageLength = uint24(bound(_messageLength, 0, 34_000));
 
         // Need more than 500 since GasBurner requires it.
@@ -666,6 +662,68 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         assertTrue(success, "L2CrossDomainMessenger call should not fail");
 
         // Message should either be in the failed or successful messages mapping.
+        bool inFailedMessages = l2CrossDomainMessenger.failedMessages(keccak256(encoded));
+        bool inSuccessfulMessages = l2CrossDomainMessenger.successfulMessages(keccak256(encoded));
+        assertTrue(
+            inFailedMessages || inSuccessfulMessages, "message should be in either failed or successful messages"
+        );
+    }
+
+    /// @notice Tests that `relayMessage` has enough base gas to finish when relaying a near-max
+    ///         L1 => L2 payload to a target that consumes all forwarded gas.
+    function test_relayMessage_nearMaxPayloadAllGasTarget_succeeds() external {
+        skipIfForkTest("L2CrossDomainMessenger doesn't exist on L1 in forked test");
+
+        // Use the PoC's _minGasLimit value referenced from client-pod#609:
+        // https://github.com/ethereum-optimism/client-pod/issues/609
+        uint32 minGasLimit = 50_000;
+
+        // Largest 32-byte-aligned user message that fits under the portal's 120k calldata cap once
+        // encoded as relayMessage(uint256,address,address,uint256,uint256,bytes). The fixed
+        // encoding overhead is 4 bytes for the selector, 6 ABI words for the nonce, sender,
+        // target, value, minGasLimit, and message offset, and 1 ABI word for the dynamic bytes
+        // length. The message length is rounded down to a 32-byte multiple because dynamic bytes
+        // data is ABI word-padded.
+        uint256 portalCalldataLimit = 120_000;
+        uint256 relayMessageEncodingOverhead = 4 + 6 * 32 + 32;
+        uint256 messageLength = ((portalCalldataLimit - relayMessageEncodingOverhead) / 32) * 32;
+        bytes memory message = new bytes(messageLength);
+        for (uint256 i = 0; i < message.length; i++) {
+            message[i] = 0x01;
+        }
+
+        uint64 baseGas = l1CrossDomainMessenger.baseGas(message, minGasLimit);
+        address target = address(new GasBurner(type(uint32).max));
+        bytes memory encoded = Encoding.encodeCrossDomainMessage(
+            Encoding.encodeVersionedNonce(0, 1), alice, target, 0, minGasLimit, message
+        );
+
+        assertEq(encoded.length, relayMessageEncodingOverhead + message.length);
+        assertLe(encoded.length, portalCalldataLimit);
+        assertGt(encoded.length + 32, portalCalldataLimit);
+
+        uint256 zeroBytesInCalldata = 0;
+        uint256 nonzeroBytesInCalldata = 0;
+        for (uint256 i = 0; i < encoded.length; i++) {
+            if (encoded[i] != bytes1(0)) {
+                nonzeroBytesInCalldata++;
+            } else {
+                zeroBytesInCalldata++;
+            }
+        }
+        // The message body is non-zero, but the ABI-encoded selector and fixed-size arguments
+        // still include zero bytes.
+        assertGt(zeroBytesInCalldata, 0);
+
+        // Actual gas on L2 is the deposited gas limit minus L2 intrinsic gas.
+        uint256 gasSupplied = baseGas - (21_000 + ((zeroBytesInCalldata + nonzeroBytesInCalldata * 4) * 4));
+
+        address caller = AddressAliasHelper.applyL1ToL2Alias(address(l1CrossDomainMessenger));
+        vm.prank(caller);
+
+        (bool success,) = address(l2CrossDomainMessenger).call{ gas: gasSupplied }(encoded);
+        assertTrue(success, "L2CrossDomainMessenger call should not fail");
+
         bool inFailedMessages = l2CrossDomainMessenger.failedMessages(keccak256(encoded));
         bool inSuccessfulMessages = l2CrossDomainMessenger.successfulMessages(keccak256(encoded));
         assertTrue(
@@ -781,7 +839,7 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         );
 
         vm.store(address(optimismPortal2), bytes32(senderSlotIndex), bytes32(abi.encode(sender)));
-        vm.etch(target, address(new Reverter()).code);
+        vm.mockCallRevert(target, bytes(hex"1111"), bytes(hex""));
         vm.deal(address(optimismPortal2), value);
         vm.prank(address(optimismPortal2));
         l1CrossDomainMessenger.relayMessage{ value: value }(
@@ -798,8 +856,9 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         assertEq(l1CrossDomainMessenger.successfulMessages(hash), false);
         assertEq(l1CrossDomainMessenger.failedMessages(hash), true);
 
-        vm.expectEmit(address(l1CrossDomainMessenger));
+        vm.clearMockedCalls();
 
+        vm.expectEmit(address(l1CrossDomainMessenger));
         emit RelayedMessage(hash);
 
         vm.etch(target, address(0).code);
@@ -926,9 +985,8 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         // Set the value of op.l2Sender() to be the L2 Cross Domain Messenger.
         vm.store(address(optimismPortal2), bytes32(senderSlotIndex), bytes32(abi.encode(sender)));
 
-        // Turn the target into a Reverter.
-        vm.etch(target, address(new Reverter()).code);
-
+        // Make the target revert.
+        vm.mockCallRevert(target, bytes(hex"1111"), bytes(hex""));
         // Target should be called with expected data.
         vm.expectCall(target, hex"1111");
 
@@ -955,7 +1013,7 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         assertEq(l1CrossDomainMessenger.failedMessages(hash), true);
 
         // Make the target not revert anymore.
-        vm.etch(target, address(0).code);
+        vm.clearMockedCalls();
 
         // Target should be called with expected data.
         vm.expectCall(target, hex"1111");
@@ -1062,8 +1120,8 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         // Set the value of op.l2Sender() to be the L2 Cross Domain Messenger.
         vm.store(address(optimismPortal2), bytes32(senderSlotIndex), bytes32(abi.encode(sender)));
 
-        // Turn the target into a Reverter.
-        vm.etch(target, address(new Reverter()).code);
+        // Make the target revert.
+        vm.mockCallRevert(target, bytes(hex"1111"), bytes(hex""));
 
         // Target should be called with expected data.
         vm.expectCall(target, hex"1111");
@@ -1087,7 +1145,7 @@ contract L1CrossDomainMessenger_Uncategorized_Test is L1CrossDomainMessenger_Tes
         assertEq(l1CrossDomainMessenger.failedMessages(hash), true);
 
         // Make the target not revert anymore.
-        vm.etch(target, address(0).code);
+        vm.clearMockedCalls();
 
         // Target should be called with expected data.
         vm.expectCall(target, hex"1111");

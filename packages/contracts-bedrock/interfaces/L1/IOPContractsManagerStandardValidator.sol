@@ -4,12 +4,13 @@ pragma solidity ^0.8.0;
 // Interfaces
 import { ISuperchainConfig } from "interfaces/L1/ISuperchainConfig.sol";
 import { ISystemConfig } from "interfaces/L1/ISystemConfig.sol";
+import { IStandardValidatorUtils } from "interfaces/L1/opcm/IStandardValidatorUtils.sol";
+import { IOPContractsManagerMigrationValidator } from "interfaces/L1/opcm/IOPContractsManagerMigrationValidator.sol";
 
 interface IOPContractsManagerStandardValidator {
     struct Implementations {
         address l1ERC721BridgeImpl;
         address optimismPortalImpl;
-        address optimismPortalInteropImpl;
         address ethLockboxImpl;
         address systemConfigImpl;
         address optimismMintableERC20FactoryImpl;
@@ -19,6 +20,12 @@ interface IOPContractsManagerStandardValidator {
         address anchorStateRegistryImpl;
         address delayedWETHImpl;
         address mipsImpl;
+        address faultDisputeGameImpl;
+        address permissionedDisputeGameImpl;
+        address superFaultDisputeGameImpl;
+        address superPermissionedDisputeGameImpl;
+        address zkDisputeGameImpl;
+        address sp1PlonkAdapterImpl;
     }
 
     struct ValidationInput {
@@ -54,15 +61,38 @@ interface IOPContractsManagerStandardValidator {
     function l1PAOMultisig() external view returns (address);
     function l1StandardBridgeImpl() external view returns (address);
     function mipsImpl() external view returns (address);
+    function faultDisputeGameImpl() external view returns (address);
+    function permissionedDisputeGameImpl() external view returns (address);
+    function superFaultDisputeGameImpl() external view returns (address);
+    function superPermissionedDisputeGameImpl() external view returns (address);
+    function zkDisputeGameImpl() external view returns (address);
+    function sp1PlonkAdapterImpl() external view returns (address);
     function optimismMintableERC20FactoryImpl() external view returns (address);
     function optimismPortalImpl() external view returns (address);
-    function optimismPortalInteropImpl() external view returns (address);
     function ethLockboxImpl() external view returns (address);
-    function permissionedDisputeGameVersion() external pure returns (string memory);
     function preimageOracleVersion() external pure returns (string memory);
     function superchainConfig() external view returns (ISuperchainConfig);
     function systemConfigImpl() external view returns (address);
     function withdrawalDelaySeconds() external view returns (uint256);
+    function standardValidatorUtils() external view returns (IStandardValidatorUtils);
+    function migrationValidator() external view returns (IOPContractsManagerMigrationValidator);
+
+    function validateMigratedChain(
+        IOPContractsManagerMigrationValidator.MigrationValidationInput memory _input,
+        bool _allowFailure
+    )
+        external
+        view
+        returns (string memory);
+
+    function validateMigratedChainWithOverrides(
+        IOPContractsManagerMigrationValidator.MigrationValidationInput memory _input,
+        bool _allowFailure,
+        ValidationOverrides memory _overrides
+    )
+        external
+        view
+        returns (string memory);
 
     function validateWithOverrides(
         ValidationInput memory _input,
@@ -87,6 +117,8 @@ interface IOPContractsManagerStandardValidator {
     function validate(ValidationInputDev memory _input, bool _allowFailure) external view returns (string memory);
 
     function __constructor__(
+        IStandardValidatorUtils _standardValidatorUtils,
+        IOPContractsManagerMigrationValidator _migrationValidator,
         Implementations memory _implementations,
         ISuperchainConfig _superchainConfig,
         address _l1PAOMultisig,

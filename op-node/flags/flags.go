@@ -109,6 +109,14 @@ var (
 		EnvVars:  prefixEnvVars("L1_BEACON_FETCH_ALL_SIDECARS"),
 		Category: L1RPCCategory,
 	}
+	BeaconSlotDurationOverride = &cli.Uint64Flag{
+		Name:     "l1.beacon.slot-duration-override",
+		Usage:    "Duration in seconds of an L1 slot. When set (non-zero), bypasses the beacon /eth/v1/config/spec fetch and uses this value as SECONDS_PER_SLOT. Useful for devnets where the beacon spec endpoint is unavailable (e.g. anvil).",
+		Required: false,
+		Value:    0,
+		EnvVars:  prefixEnvVars("L1_BEACON_SLOT_DURATION_OVERRIDE"),
+		Category: L1RPCCategory,
+	}
 	SyncModeFlag = &cli.GenericFlag{
 		Name:     "syncmode",
 		Usage:    fmt.Sprintf("Blockchain sync mode (options: %s)", openum.EnumString(sync.ModeStrings)),
@@ -118,10 +126,20 @@ var (
 	}
 	SyncModeReqRespFlag = &cli.BoolFlag{
 		Name:     "syncmode.req-resp",
+		Usage:    "Deprecated, no-op flag. The Req/Resp CL P2P sync protocol has been removed; this is always disabled.",
 		Required: false,
-		Value:    true,
+		Value:    false,
 		EnvVars:  prefixEnvVars("SYNCMODE_REQ_RESP"),
 		Category: RollupCategory,
+		Hidden:   true,
+	}
+	SyncModeOffsetELSafeFlag = &cli.DurationFlag{
+		Name: "syncmode.offset-el-safe",
+		Usage: "After execution-layer sync completes, set safe and finalized heads to this duration behind the synced tip " +
+			"(converted to L2 blocks via rollup block time using ceiling division). Default 12h, matching the OP Mainnet sequencing window.",
+		EnvVars:  prefixEnvVars("SYNCMODE_OFFSET_EL_SAFE"),
+		Category: RollupCategory,
+		Value:    12 * time.Hour,
 	}
 	RPCAdminPersistence = &cli.StringFlag{
 		Name:     "rpc.admin-state",
@@ -205,7 +223,7 @@ var (
 			openum.EnumString(engine.Kinds),
 		EnvVars: prefixEnvVars("L2_ENGINE_KIND"),
 		Value: func() *engine.Kind {
-			out := engine.Geth
+			out := engine.Reth
 			return &out
 		}(),
 		Category: RollupCategory,
@@ -217,19 +235,19 @@ var (
 		Value:    time.Second * 10,
 		Category: RollupCategory,
 	}
-	L2UnsafeOnly = &cli.BoolFlag{
-		Name:     "l2.unsafe-only",
-		Usage:    "Disable derivation",
-		EnvVars:  prefixEnvVars("L2_UNSAFE_ONLY"),
-		Category: RollupCategory,
-		Required: false,
-	}
 	L2FollowSource = &cli.StringFlag{
 		Name:     "l2.follow.source",
-		Usage:    "Address of L2 EL RPC HTTP endpoint to fetch safe/finalized blocks",
+		Usage:    "Address of L2 CL RPC HTTP endpoint to follow source",
 		EnvVars:  prefixEnvVars("L2_FOLLOW_SOURCE"),
 		Category: RollupCategory,
 		Required: false,
+	}
+	L2FollowSourceRpcTimeout = &cli.DurationFlag{
+		Name:     "l2.follow.source.rpc-timeout",
+		Usage:    "L2 follow source client rpc timeout",
+		EnvVars:  prefixEnvVars("L2_FOLLOW_SOURCE_RPC_TIMEOUT"),
+		Value:    time.Second * 10,
+		Category: RollupCategory,
 	}
 	VerifierL1Confs = &cli.Uint64Flag{
 		Name:     "verifier.l1-confs",
@@ -269,6 +287,15 @@ var (
 		Usage:    "Forces the sequencer to strictly prepare the next L1 origin and create empty L2 blocks",
 		EnvVars:  prefixEnvVars("SEQUENCER_RECOVER"),
 		Value:    false,
+		Category: SequencerCategory,
+	}
+	SequencerSealingDurationFlag = &cli.DurationFlag{
+		Name: "sequencer.sealing-duration",
+		Usage: "This is the amount of the time the sequencer allocates to sealing the block " +
+			"(i.e. it will fetch the payload from the execution engine this much prior to the block's timestamp). " +
+			"If this is <= 0 it is automatically adjusted to 50ms.",
+		EnvVars:  prefixEnvVars("SEQUENCER_SEALING_DURATION"),
+		Value:    50 * time.Millisecond,
 		Category: SequencerCategory,
 	}
 	FinalityLookbackFlag = &cli.Uint64Flag{
@@ -324,18 +351,6 @@ var (
 		EnvVars:  prefixEnvVars("HEARTBEAT_URL"),
 		Category: OperationsCategory,
 		Hidden:   true,
-	}
-	RollupHalt = &cli.StringFlag{
-		Name:     "rollup.halt",
-		Usage:    "Opt-in option to halt on incompatible protocol version requirements of the given level (major/minor/patch/none), as signaled onchain in L1",
-		EnvVars:  prefixEnvVars("ROLLUP_HALT"),
-		Category: RollupCategory,
-	}
-	RollupLoadProtocolVersions = &cli.BoolFlag{
-		Name:     "rollup.load-protocol-versions",
-		Usage:    "Load protocol versions from the superchain L1 ProtocolVersions contract (if available), and report in logs and metrics",
-		EnvVars:  prefixEnvVars("ROLLUP_LOAD_PROTOCOL_VERSIONS"),
-		Category: RollupCategory,
 	}
 	SafeDBPath = &cli.StringFlag{
 		Name:     "safedb.path",
@@ -400,33 +415,6 @@ var (
 		Category: SequencerCategory,
 	}
 	/* Interop flags, experimental. */
-	InteropRPCAddr = &cli.StringFlag{
-		Name: "interop.rpc.addr",
-		Usage: "Interop Websocket-only RPC listening address, for supervisor service to manage syncing of the op-node." +
-			"Applies only to Interop-enabled networks. Optional, disabled if left empty. " +
-			"Do not enable if you do not run a supervisor service.",
-		EnvVars:  prefixEnvVars("INTEROP_RPC_ADDR"),
-		Value:    "",
-		Category: InteropCategory,
-	}
-	InteropRPCPort = &cli.IntFlag{
-		Name: "interop.rpc.port",
-		Usage: "Interop RPC listening port, to serve supervisor syncing." +
-			"Applies only to Interop-enabled networks.",
-		EnvVars:  prefixEnvVars("INTEROP_RPC_PORT"),
-		Value:    9645, // Note: op-service/rpc/cli.go uses 8545 as the default.
-		Category: InteropCategory,
-	}
-	InteropJWTSecret = &cli.StringFlag{
-		Name: "interop.jwt-secret",
-		Usage: "Interop RPC server authentication. Path to JWT secret key. Keys are 32 bytes, hex encoded in a file. " +
-			"A new key will be generated if the file is empty. " +
-			"Applies only to Interop-enabled networks.",
-		EnvVars:     prefixEnvVars("INTEROP_JWT_SECRET"),
-		Value:       "",
-		Destination: new(string),
-		Category:    InteropCategory,
-	}
 	InteropDependencySet = &cli.PathFlag{
 		Name:      "interop.dependency-set",
 		Usage:     "Dependency-set configuration, point at JSON file.",
@@ -466,8 +454,9 @@ var optionalFlags = []cli.Flag{
 	BeaconFallbackAddrs,
 	BeaconCheckIgnore,
 	BeaconFetchAllSidecars,
+	BeaconSlotDurationOverride,
 	SyncModeFlag,
-	SyncModeReqRespFlag,
+	SyncModeOffsetELSafeFlag,
 	FetchWithdrawalRootFromState,
 	L1TrustRPC,
 	L1RPCProviderKind,
@@ -482,6 +471,7 @@ var optionalFlags = []cli.Flag{
 	SequencerMaxSafeLagFlag,
 	SequencerL1Confs,
 	SequencerRecoverMode,
+	SequencerSealingDurationFlag,
 	FinalityLookbackFlag,
 	FinalityDelayFlag,
 	L1EpochPollIntervalFlag,
@@ -491,8 +481,6 @@ var optionalFlags = []cli.Flag{
 	HeartbeatEnabledFlag,
 	HeartbeatMonikerFlag,
 	HeartbeatURLFlag,
-	RollupHalt,
-	RollupLoadProtocolVersions,
 	ConductorEnabledFlag,
 	ConductorRpcFlag,
 	ConductorRpcTimeoutFlag,
@@ -500,11 +488,8 @@ var optionalFlags = []cli.Flag{
 	L1ChainConfig,
 	L2EngineKind,
 	L2EngineRpcTimeout,
-	L2UnsafeOnly,
 	L2FollowSource,
-	InteropRPCAddr,
-	InteropRPCPort,
-	InteropJWTSecret,
+	L2FollowSourceRpcTimeout,
 	InteropDependencySet,
 	IgnoreMissingPectraBlobSchedule,
 	ExperimentalOPStackAPI,
@@ -516,6 +501,7 @@ var DeprecatedFlags = []cli.Flag{
 	BetaExtraNetworks,
 	BackupL2UnsafeSyncRPC,
 	BackupL2UnsafeSyncRPCTrustRPC,
+	SyncModeReqRespFlag,
 	// Deprecated P2P Flags are added at the init step
 }
 
@@ -523,8 +509,8 @@ var DeprecatedFlags = []cli.Flag{
 var Flags []cli.Flag
 
 var rpcDefaults = oprpc.CLIConfig{
-	ListenAddr:  "0.0.0.0", // TODO(#16487): Switch to 127.0.0.1
-	ListenPort:  9545,      // op-node defaults to a different port than ethereum EL (8545)
+	ListenAddr:  "0.0.0.0",
+	ListenPort:  9545, // op-node defaults to a different port than ethereum EL (8545)
 	EnableAdmin: false,
 }
 

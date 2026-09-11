@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.7.0 <0.9.0;
 
-import "forge-std/Test.sol";
-import { LibSort } from "@solady/utils/LibSort.sol";
+// Forge
+import { console2 as console } from "forge-std/console2.sol";
+import { Vm } from "forge-std/Vm.sol";
+
+// Testing
+import "./CompatibilityFallbackHandler_1_3_0.sol";
+
+// Contracts
 import { Safe as GnosisSafe } from "safe-contracts/Safe.sol";
+import { SafeProxyFactory as GnosisSafeProxyFactory } from "safe-contracts/proxies/SafeProxyFactory.sol";
+import { SignMessageLib } from "safe-contracts/libraries/SignMessageLib.sol";
+
+// Libraries
+import { LibSort } from "@solady/utils/LibSort.sol";
 import { OwnerManager } from "safe-contracts/base/OwnerManager.sol";
 import { ModuleManager } from "safe-contracts/base/ModuleManager.sol";
 import { GuardManager } from "safe-contracts/base/GuardManager.sol";
-import { SafeProxyFactory as GnosisSafeProxyFactory } from "safe-contracts/proxies/SafeProxyFactory.sol";
 import { Enum } from "safe-contracts/common/Enum.sol";
-import { SignMessageLib } from "safe-contracts/libraries/SignMessageLib.sol";
-import "./CompatibilityFallbackHandler_1_3_0.sol";
 
 // Tools to simplify testing Safe contracts
 // Author: Colin Nielsen (https://github.com/colinnielsen/safe-tools)
@@ -156,44 +164,6 @@ library SafeTestLib {
             revert("SAFETESTTOOLS: issue with private key sorting, please open a ticket on github");
         }
         return sortedPKs;
-    }
-
-    /// @dev Sign a transaction as a safe owner with a private key.
-    function signTransaction(
-        SafeInstance memory instance,
-        uint256 pk,
-        address to,
-        uint256 value,
-        bytes memory data,
-        Enum.Operation operation,
-        uint256 safeTxGas,
-        uint256 baseGas,
-        uint256 gasPrice,
-        address gasToken,
-        address refundReceiver
-    )
-        internal
-        view
-        returns (uint8 v, bytes32 r, bytes32 s)
-    {
-        bytes32 txDataHash;
-        {
-            uint256 _nonce = instance.safe.nonce();
-            txDataHash = instance.safe.getTransactionHash({
-                to: to,
-                value: value,
-                data: data,
-                operation: operation,
-                safeTxGas: safeTxGas,
-                baseGas: baseGas,
-                gasPrice: gasPrice,
-                gasToken: gasToken,
-                refundReceiver: refundReceiver,
-                _nonce: _nonce
-            });
-        }
-
-        (v, r, s) = Vm(VM_ADDR).sign(pk, txDataHash);
     }
 
     /// @dev Get the previous owner in the linked list of owners.
@@ -342,12 +312,6 @@ library SafeTestLib {
         EIP1271Sign(instance, abi.encodePacked(digest));
     }
 
-    /// @dev Increments the nonce of the Safe by sending an empty transaction.
-    function incrementNonce(SafeInstance memory instance) internal returns (uint256 newNonce) {
-        execTransaction(instance, address(0), 0, "", Enum.Operation.Call, 0, 0, 0, address(0), address(0), "");
-        return instance.safe.nonce();
-    }
-
     /// @dev Adds a new owner to the safe
     function changeThreshold(SafeInstance memory instance, uint256 threshold) internal {
         execTransaction(instance, address(instance.safe), 0, abi.encodeCall(OwnerManager.changeThreshold, (threshold)));
@@ -486,13 +450,6 @@ contract SafeTestTools {
     SafeInstance[] internal instances;
 
     uint256 internal saltNonce = uint256(keccak256(bytes("SAFE TEST")));
-
-    /// @dev can be called to reinitialize the singleton, proxyFactory and handler. Useful for forking.
-    function _initializeSafeTools() internal {
-        singleton = new GnosisSafe();
-        proxyFactory = new GnosisSafeProxyFactory();
-        handler = new CompatibilityFallbackHandler();
-    }
 
     /// @dev Sets up a Safe with the given parameters.
     /// @param ownerPKs The public keys of the owners.

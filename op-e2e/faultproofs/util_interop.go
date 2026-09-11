@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/wait"
 	"github.com/ethereum-optimism/optimism/op-e2e/interop"
 	"github.com/ethereum-optimism/optimism/op-e2e/system/e2esys"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +32,7 @@ func StartInteropFaultDisputeSystem(t *testing.T, opts ...faultDisputeConfigOpts
 	}
 
 	recipe := interopgen.InteropDevRecipe{
-		L1ChainID:        InteropL1ChainID.Uint64(),
+		L1ChainID:        bigs.Uint64Strict(InteropL1ChainID),
 		L2s:              []interopgen.InteropDevL2Recipe{{ChainID: 900200}, {ChainID: 900201}},
 		GenesisTimestamp: uint64(time.Now().Unix() + 3), // start chain 3 seconds from now
 	}
@@ -58,14 +59,14 @@ func StartInteropFaultDisputeSystem(t *testing.T, opts ...faultDisputeConfigOpts
 	// Also ensures the L1 has advanced past genesis which can otherwise cause gas estimation problems
 	var lastError error
 	err = wait.For(ctx, 1*time.Minute, func() (bool, error) {
-		status, err := s2.SupervisorClient().SyncStatus(ctx)
+		status, err := s2.SupernodeClient().SyncStatus(ctx)
 		if err != nil {
 			lastError = err
 			return false, nil
 		}
-		return status.SafeTimestamp > recipe.GenesisTimestamp && status.MinSyncedL1.Number > 0, nil
+		return status.SafeTimestamp > recipe.GenesisTimestamp && status.CurrentL1.Number > 0, nil
 	})
-	require.NoErrorf(t, err, "failed to wait for supervisor to sync genesis: %v", lastError)
+	require.NoErrorf(t, err, "failed to wait for supernode to sync genesis: %v", lastError)
 
 	return s2, factory, s2.L1GethClient()
 }

@@ -3,22 +3,45 @@ package multi
 import (
 	"testing"
 
+	bss "github.com/ethereum-optimism/optimism/op-batcher/batcher"
 	"github.com/ethereum-optimism/optimism/op-devstack/devtest"
 	"github.com/ethereum-optimism/optimism/op-devstack/presets"
+	"github.com/ethereum-optimism/optimism/op-devstack/sysgo"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/sync"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
-	"github.com/ethereum-optimism/optimism/op-supervisor/supervisor/types"
+
+	safety "github.com/ethereum-optimism/optimism/op-service/eth/safety"
 )
 
+func simpleWithSyncTesterOpts() []presets.Option {
+	return []presets.Option{
+		presets.WithGlobalL2CLOption(sysgo.L2CLOptionFn(func(_ devtest.T, id sysgo.ComponentTarget, cfg *sysgo.L2CLConfig) {
+			cfg.VerifierSyncMode = sync.ELSync
+		})),
+		presets.WithGlobalSyncTesterELOption(sysgo.SyncTesterELOptionFn(func(_ devtest.T, id sysgo.ComponentTarget, cfg *sysgo.SyncTesterELConfig) {
+			cfg.ELSyncActive = true
+		})),
+		presets.WithBatcherOption(func(id sysgo.ComponentTarget, cfg *bss.CLIConfig) {
+			// For stopping derivation, not to advance safe heads
+			cfg.Stopped = true
+		}),
+	}
+}
+
 func TestMultiELSync(gt *testing.T) {
-	t := devtest.SerialT(gt)
-	sys := presets.NewSimpleWithSyncTester(t)
+	t := devtest.ParallelT(gt)
+	sys := presets.NewSimpleWithSyncTester(t, simpleWithSyncTesterOpts()...)
 	require := t.Require()
 
 	// Stop L2CL2 to control SyncTesterL2EL manually
 	sys.L2CL2.Stop()
 
+	// Clear any payloads L2CL2 pushed before Stop completed — a leftover policy
+	// cache entry can flip SYNCING to VALID one step early and flake the test.
+	sys.SyncTester.ResetAllSessions()
+
 	// Advance few blocks to make sure reference node advanced
-	sys.L2CL.Advanced(types.LocalUnsafe, 10, 30)
+	sys.L2CL.Advanced(safety.LocalUnsafe, 10, 30)
 
 	// Manually trigger multiple EL Syncs using the engine API
 	startNum := sys.SyncTesterL2EL.BlockRefByLabel(eth.Unsafe).Number

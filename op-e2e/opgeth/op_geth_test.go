@@ -24,7 +24,9 @@ import (
 	"github.com/ethereum-optimism/optimism/op-e2e/system/e2esys"
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/testutils"
 )
 
 var (
@@ -38,7 +40,7 @@ var (
 // TestMissingGasLimit tests that op-geth cannot build a block without gas limit while optimism is active in the chain config.
 func TestMissingGasLimit(t *testing.T) {
 	op_e2e.InitParallel(t)
-	cfg := e2esys.DefaultSystemConfig(t)
+	cfg := opGethSystemConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	opGeth, err := NewOpGeth(t, ctx, &cfg)
@@ -62,7 +64,7 @@ func TestMissingGasLimit(t *testing.T) {
 // The L1 Info deposit always takes gas so the effective gas limit is lower than the full block gas limit.
 func TestTxGasSameAsBlockGasLimit(t *testing.T) {
 	op_e2e.InitParallel(t)
-	cfg := e2esys.DefaultSystemConfig(t)
+	cfg := opGethSystemConfig(t)
 	sys, err := cfg.Start(t)
 	require.Nil(t, err, "Error starting up system")
 
@@ -82,7 +84,7 @@ func TestTxGasSameAsBlockGasLimit(t *testing.T) {
 // This tests that deposits must always allow the block to be built even if they are invalid.
 func TestInvalidDepositInFCU(t *testing.T) {
 	op_e2e.InitParallel(t)
-	cfg := e2esys.DefaultSystemConfig(t)
+	cfg := opGethSystemConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	opGeth, err := NewOpGeth(t, ctx, &cfg)
@@ -122,7 +124,7 @@ func TestInvalidDepositInFCU(t *testing.T) {
 // for stability and tx-privacy.
 func TestGethOnlyPendingBlockIsLatest(t *testing.T) {
 	op_e2e.InitParallel(t)
-	cfg := e2esys.DefaultSystemConfig(t)
+	cfg := opGethSystemConfig(t)
 	cfg.DeployConfig.FundDevAccounts = true
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -340,11 +342,12 @@ func TestPreregolith(t *testing.T) {
 
 			contractBalance, err := opGeth.L2Client.BalanceAt(ctx, incorrectContractAddress, nil)
 			require.NoError(t, err)
-			require.Equal(t, uint64(0), contractBalance.Uint64(), "balance unchanged on incorrect contract address")
+			require.Zero(t, contractBalance.BitLen(), "balance unchanged on incorrect contract address")
 
 			contractBalance, err = opGeth.L2Client.BalanceAt(ctx, correctContractAddress, nil)
 			require.NoError(t, err)
-			require.Equal(t, uint64(params.Ether), contractBalance.Uint64(), "balance changed on correct contract address")
+			require.Truef(t, bigs.Equal(big.NewInt(params.Ether), contractBalance),
+				"balance changed on correct contract address, expected %v, got %v", params.Ether, contractBalance)
 
 			// Check the actual transaction nonce is reported correctly when retrieving the tx from the API.
 			tx, _, err := opGeth.L2Client.TransactionByHash(ctx, contractCreateTx.Hash())
@@ -409,7 +412,7 @@ func TestPreregolith(t *testing.T) {
 			systemTx.IsSystemTransaction = true
 			require.NoError(t, err)
 
-			_, err = opGeth.AddL2Block(ctx, types.NewTx(systemTx))
+			_, err = opGeth.AddL2Block(ctx, testutils.TxFromDeposit(systemTx))
 			require.NoError(t, err, "should allow blocks containing system tx")
 		})
 	}
@@ -527,7 +530,7 @@ func TestRegolith(t *testing.T) {
 
 			contractBalance, err := opGeth.L2Client.BalanceAt(ctx, createRcpt.ContractAddress, nil)
 			require.NoError(t, err)
-			require.Equal(t, uint64(params.Ether), contractBalance.Uint64(), "balance changed on correct contract address")
+			require.Truef(t, bigs.Equal(big.NewInt(params.Ether), contractBalance), "balance changed on correct contract address, expected %v, got %v", params.Ether, contractBalance)
 
 			// Check the actual transaction nonce is reported correctly when retrieving the tx from the API.
 			tx, _, err := opGeth.L2Client.TransactionByHash(ctx, contractCreateTx.Hash())
@@ -598,11 +601,12 @@ func TestRegolith(t *testing.T) {
 
 			rollupCfg := rollup.Config{}
 			systemTx, err := derive.L1InfoDeposit(&rollupCfg, opGeth.L1ChainConfig, opGeth.SystemConfig, 1, opGeth.L1Head, 0)
+			systemTx.Gas = 26_000
 			systemTx.IsSystemTransaction = true
 			require.NoError(t, err)
 
-			_, err = opGeth.AddL2Block(ctx, types.NewTx(systemTx))
-			require.ErrorIs(t, err, ErrNewPayloadNotValid, "should reject blocks containing system tx")
+			_, err = opGeth.AddL2Block(ctx, testutils.TxFromDeposit(systemTx))
+			require.ErrorIs(t, err, ErrForkChoiceUpdated, "should reject blocks containing system tx")
 		})
 
 		t.Run("IncludeGasRefunds_"+test.name, func(t *testing.T) {
